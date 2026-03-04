@@ -1,0 +1,48 @@
+#!/bin/bash
+# dev-tracker: Development state tracking with checkpoint-based rollback
+set -e
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+用法: devtrack <命令> [选项]
+
+命令 (中文 / English):
+  初始化   | init                    初始化项目追踪
+  检查点   | checkpoint <label>      创建命名检查点快照
+  上下文   | context                 生成 AI 可读的上下文摘要
+  状态     | status                  显示当前开发状态
+  对比     | diff [checkpoint]       对比当前文件与检查点差异
+  回滚     | rollback <name>         恢复到检查点 (--dry-run / --apply)
+  会话     | session start|end|list  管理 AI 会话生命周期
+
+运行 'devtrack <命令> --help' 查看各命令详细帮助。
+EOF
+}
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+cmd="$1"
+shift
+
+case "$cmd" in
+    init|初始化)       exec "$SCRIPT_DIR/devtrack-init.sh" "$@" ;;
+    checkpoint|检查点)  exec "$SCRIPT_DIR/devtrack-checkpoint.sh" "$@" ;;
+    context|上下文)     exec "$SCRIPT_DIR/devtrack-context.sh" "$@" ;;
+    status|状态)        exec "$SCRIPT_DIR/devtrack-status.sh" "$@" ;;
+    diff|对比)          exec "$SCRIPT_DIR/devtrack-diff.sh" "$@" ;;
+    rollback|回滚)      exec "$SCRIPT_DIR/devtrack-rollback.sh" "$@" ;;
+    session|会话)       exec "$SCRIPT_DIR/devtrack-session.sh" "$@" ;;
+    -h|--help|帮助)     usage; exit 0 ;;
+    *)          echo "未知命令: $cmd" >&2; usage >&2; exit 1 ;;
+esac
