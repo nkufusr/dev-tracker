@@ -91,6 +91,26 @@ _snap_collect_all_files() {
     rm -f "$exclude_file"
 }
 
+# snapshot_manifest_only <output_json> — 轻量：只记录文件路径和 SHA-256，不复制文件
+snapshot_manifest_only() {
+    local out_file="$1"
+    local project_root="$PWD"
+    local files_json="[]"
+
+    while IFS= read -r relpath; do
+        [ -z "$relpath" ] && continue
+        relpath="${relpath#./}"
+        fullpath="$project_root/$relpath"
+        [ -f "$fullpath" ] || continue
+        sha="$(dt_sha256 "$fullpath")"
+        files_json="$(echo "$files_json" | jq --arg p "$fullpath" --arg sha "$sha" \
+            '. + [{"path": $p, "sha256": $sha}]')"
+    done < <(_snap_collect_all_files)
+
+    jq -n --arg ts "$(dt_iso_timestamp)" --argjson files "$files_json" \
+        '{created_at: $ts, local_files: $files}' > "$out_file"
+}
+
 # snapshot_create <output_dir> <description>
 snapshot_create() {
     local out_dir="$1"
