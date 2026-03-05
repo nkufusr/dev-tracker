@@ -1,85 +1,42 @@
 ---
 name: dev-tracker
-description: Use when starting a new conversation on any project to load current development state, when completing a feature or fix to create a checkpoint, or when needing to rollback to a previous known-good state
+description: Use when starting a new AI conversation on any project to load development state, when finishing work to save progress, or when needing to undo changes from the last session
 ---
 
-# dev-tracker: Development State Tracking
+# dev-tracker: AI 开发状态自动追踪
 
 ## Overview
 
-Automated development state tracking with checkpoint-based rollback. Replaces manual handoff documents and rollback packages with a unified, scriptable system.
+自动追踪所有文件变更，3 个命令管理开发状态。每次会话自动快照，支持一键回滚。
 
 ## When to Use
 
-- **New conversation**: Run `devtrack context` to load current project state
-- **After completing work**: Run `devtrack checkpoint <label>` to snapshot
-- **Need to undo**: Run `devtrack rollback <checkpoint>` to restore
-- **Resuming work**: Run `devtrack status` to see where things stand
+- **新对话开始**: 检查项目是否有 `.devtrack/` 目录，有则运行 `devtrack 开始`
+- **工作完成时**: 运行 `devtrack 结束 "做了什么"`
+- **出问题要恢复**: 运行 `devtrack 回滚`
 
-## Quick Reference
+## Commands
 
-| Command | Purpose |
-|---------|---------|
-| `devtrack init` | Initialize tracking for a project |
-| `devtrack checkpoint <label>` | Create a named checkpoint (code + state + remote) |
-| `devtrack context` | Generate AI-readable context summary |
-| `devtrack status` | Show current development state |
-| `devtrack diff [checkpoint]` | Compare current state against a checkpoint |
-| `devtrack rollback <name>` | Restore to a checkpoint (supports `--dry-run`) |
-| `devtrack session start` | Begin session recording |
-| `devtrack session end [summary]` | End session, archive log |
-
-All scripts live in `~/.claude/skills/dev-tracker/scripts/`.
-
-## Workflow
-
-```dot
-digraph devtrack_flow {
-    rankdir=TB;
-    "New conversation" [shape=doublecircle];
-    "devtrack context" [shape=box];
-    "Work on tasks" [shape=box];
-    "devtrack checkpoint" [shape=box];
-    "Problem found?" [shape=diamond];
-    "devtrack rollback" [shape=box];
-    "Session end" [shape=doublecircle];
-
-    "New conversation" -> "devtrack context";
-    "devtrack context" -> "Work on tasks";
-    "Work on tasks" -> "devtrack checkpoint" [label="feature done"];
-    "devtrack checkpoint" -> "Problem found?";
-    "Problem found?" -> "devtrack rollback" [label="yes"];
-    "Problem found?" -> "Session end" [label="no"];
-    "devtrack rollback" -> "Work on tasks";
-}
-```
+| 命令 | 功能 |
+|------|------|
+| `devtrack 开始` | 自动快照当前状态 + 生成 AI 上下文 |
+| `devtrack 结束 [摘要]` | 自动保存所有变更 + 记录差异 |
+| `devtrack 回滚` | 恢复到上次会话开始前（默认预演，--apply 执行） |
 
 ## AI Integration Rules
 
-1. **Session start**: Always run `devtrack context` at conversation start if `.devtrack/` exists
-2. **Auto-suggest checkpoint**: After completing any feature/fix, suggest `devtrack checkpoint`
-3. **Before risky changes**: Suggest checkpoint before modifying production configs or remote servers
-4. **Session end**: Run `devtrack session end` with a brief summary of what was accomplished
+1. **每次新对话**: 若 `.devtrack/` 存在，先运行 `devtrack 开始`
+2. **结束工作时**: 运行 `devtrack 结束 "简述本次工作"`，AI 应主动提醒
+3. **回滚**: `devtrack 回滚` 预演，确认后 `devtrack 回滚 --apply`
 
-## State Files
+## How It Works
 
-- `.devtrack/config.yaml` — project configuration (tracked paths, remote servers, build commands)
-- `.devtrack/state.yaml` — current development state (tasks, focus, blockers, decisions, risks)
-- `.devtrack/timeline.yaml` — ordered event log
-- `.devtrack/context.md` — auto-generated AI context summary
+`devtrack 开始` 自动快照所有追踪文件（本地+远程），然后输出上下文摘要。
+`devtrack 结束` 再次快照，自动对比找出变更/新增/删除的文件并记录。
+`devtrack 回滚` 从"开始前快照"恢复所有文件到会话开始前的状态。
 
-## Checkpoint Contents
-
-Each checkpoint in `.devtrack/checkpoints/<timestamp>-<label>/` contains:
-- `manifest.json` — file inventory with SHA-256 checksums (local + remote)
-- `state.yaml` — development state snapshot
-- `originals/` — backup copies of all tracked files
-- `rollback.sh` — auto-generated restore script (`--dry-run` / `--apply`)
-- `verify.sh` — auto-generated post-rollback verification
-- `summary.md` — human/AI readable checkpoint description
-
-## Common Mistakes
-
-- Forgetting to run `devtrack context` in a new conversation (loses continuity)
-- Creating checkpoints without meaningful labels (hard to identify later)
-- Running `rollback --apply` without `--dry-run` first on remote resources
+每个会话存储在 `.devtrack/sessions/<timestamp>/`:
+- `snapshot-before/` — 会话开始前的文件快照
+- `snapshot-after/` — 会话结束后的文件快照
+- `changes.md` — 自动生成的变更记录
+- `session.yaml` — 会话元数据
