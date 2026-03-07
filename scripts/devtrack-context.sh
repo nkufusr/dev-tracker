@@ -38,15 +38,15 @@ now="$(date '+%Y-%m-%d %H:%M')"
 
 # ── 辅助函数 ──────────────────────────────────────────────
 
-# 读取上次已完成会话
-_ctx_last_session() {
+# 读取上次已结束会话（不含当前 active）
+_ctx_last_ended_session() {
     local active=""
     [ -f "$DEVTRACK_DIR/.active_session" ] && active="$(cat "$DEVTRACK_DIR/.active_session")"
     for sid in $(ls -1r "$DEVTRACK_SESSIONS" 2>/dev/null); do
         [ "$sid" = "$active" ] && continue
         local status
         status="$(grep '^status:' "$DEVTRACK_SESSIONS/$sid/session.yaml" 2>/dev/null | sed -E 's/^status:\s*"?([^"]*)"?$/\1/')"
-        if [ "$status" = "completed" ]; then
+        if [ "$status" = "completed" ] || [ "$status" = "interrupted" ] || [ "$status" = "failed" ] || [ "$status" = "abandoned" ]; then
             echo "$sid"
             return
         fi
@@ -114,16 +114,18 @@ set +e
     echo "# $project_name 开发状态 ($now)"
     echo ""
 
-    # ── 1. 上次会话完成的工作（最重要，放最前） ──
-    last_sid="$(_ctx_last_session)"
+    # ── 1. 上次会话结果（最重要，放最前） ──
+    last_sid="$(_ctx_last_ended_session)"
     if [ -n "$last_sid" ]; then
         last_dir="$DEVTRACK_SESSIONS/$last_sid"
         last_summary="$(grep '^summary:' "$last_dir/session.yaml" 2>/dev/null | sed -E 's/^summary:\s*"?([^"]*)"?$/\1/')"
         last_ended="$(grep '^ended_at:' "$last_dir/session.yaml" 2>/dev/null | sed -E 's/^ended_at:\s*"?([^"]*)"?$/\1/')"
         last_changed="$(grep '^files_changed:' "$last_dir/session.yaml" 2>/dev/null | sed -E 's/^files_changed:\s*//')"
+        last_status="$(grep '^status:' "$last_dir/session.yaml" 2>/dev/null | sed -E 's/^status:\s*"?([^"]*)"?$/\1/')"
 
-        echo "## 上次会话完成的工作"
+        echo "## 上次会话结果"
         echo "时间: $last_ended | 变更: ${last_changed:-0} 个文件"
+        echo "状态: ${last_status:-unknown}"
         echo "$last_summary"
 
         # 显示具体变更文件（≤5 个时展开）
@@ -239,6 +241,8 @@ set +e
             [ -z "$s_summary" ] && continue
             case "$s_status" in
                 completed)  tag="完成" ;;
+                interrupted) tag="中断" ;;
+                failed)     tag="失败" ;;
                 abandoned)  tag="废弃" ;;
                 active)     tag="进行中" ;;
                 *)          tag="$s_status" ;;
