@@ -142,7 +142,7 @@ _snap_collect_all_files() {
                 if [ ${#find_prune_args[@]} -gt 0 ]; then
                     find_prune_args+=( -o )
                 fi
-                find_prune_args+=( -path "./$pattern" )
+                find_prune_args+=( "(" -path "./$pattern" -o -path "*/$pattern" ")" )
                 ;;
         esac
     done < "$exclude_file"
@@ -192,7 +192,7 @@ _snap_collect_all_files() {
                 # 简单目录名或路径
                 *)
                     case "$filepath_rel" in
-                        "$p"|"$p"/*) skip=1; break ;;
+                        "$p"|"$p"/*|*/"$p"|*/"$p"/*) skip=1; break ;;
                     esac
                     ;;
             esac
