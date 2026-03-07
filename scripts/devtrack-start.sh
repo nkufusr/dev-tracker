@@ -9,11 +9,20 @@ source "$SCRIPT_DIR/lib/snapshot.sh"
 dt_require_init
 dt_require_jq
 
-# 如果有活跃会话，先自动结束
+# 如果有活跃会话，标记为废弃（不触发全量备份，那次会话未完成不值得备份）
 if [ -f "$DEVTRACK_DIR/.active_session" ]; then
-    active="$(cat "$DEVTRACK_DIR/.active_session")"
-    dt_warn "上一个会话 ($active) 未结束，自动关闭中..."
-    "$SCRIPT_DIR/devtrack-end.sh" "自动关闭（被新会话替代）" 2>/dev/null || true
+    abandoned="$(cat "$DEVTRACK_DIR/.active_session")"
+    abandoned_dir="$DEVTRACK_SESSIONS/$abandoned"
+    dt_warn "上一个会话 ($abandoned) 未正常结束，标记为废弃"
+    if [ -f "$abandoned_dir/session.yaml" ]; then
+        tmp="$(mktemp)"
+        sed -E "s|^status:.*|status: \"abandoned\"|" "$abandoned_dir/session.yaml" > "$tmp"
+        sed -i -E "s|^ended_at:.*|ended_at: \"$(dt_iso_timestamp)\"|" "$tmp"
+        sed -i -E "s|^summary:.*|summary: \"废弃（新会话覆盖）\"|" "$tmp"
+        mv -f "$tmp" "$abandoned_dir/session.yaml"
+    fi
+    dt_timeline_append "session_abandoned" "会话废弃（未正常结束）: $abandoned"
+    rm -f "$DEVTRACK_DIR/.active_session"
 fi
 
 SESSION_ID="$(dt_timestamp)"
@@ -46,33 +55,9 @@ echo "$SESSION_ID" > "$DEVTRACK_DIR/.active_session"
 dt_timeline_append "session_start" "会话开始: $SESSION_ID"
 dt_yaml_set "$DEVTRACK_STATE" "updated_at" "$(dt_iso_timestamp)"
 
-# 4) 输出 AI 上下文
+# 4) 输出 AI 上下文（包含上次会话、回滚包、项目文档）
 dt_info ""
 "$SCRIPT_DIR/devtrack-context.sh" --stdout-only 2>/dev/null || true
-
-# 5) 上次会话摘要
-last_session="$(ls -1r "$DEVTRACK_SESSIONS" 2>/dev/null | grep -v "^${SESSION_ID}$" | head -1 || true)"
-if [ -n "$last_session" ] && [ -f "$DEVTRACK_SESSIONS/$last_session/session.yaml" ]; then
-    last_summary="$(grep '^summary:' "$DEVTRACK_SESSIONS/$last_session/session.yaml" | sed -E 's/^summary:\s*"?([^"]*)"?$/\1/' || true)"
-    if [ -n "$last_summary" ] && [ "$last_summary" != "" ]; then
-        echo ""
-        echo "--- 上次会话 ($last_session) ---"
-        echo "$last_summary"
-    fi
-fi
-
-# 6) 提示回滚包状态
-ROLLBACK_DIR="$DEVTRACK_DIR/rollback"
-if [ -d "$ROLLBACK_DIR" ] && [ -f "$ROLLBACK_DIR/manifest.json" ]; then
-    rb_time="$(jq -r '.created_at' "$ROLLBACK_DIR/manifest.json")"
-    rb_count="$(jq '.local_files | length' "$ROLLBACK_DIR/manifest.json")"
-    echo ""
-    dt_info "当前回滚包: $rb_time ($rb_count 个文件)"
-    dt_info "  如需回滚: devtrack 回滚"
-else
-    echo ""
-    dt_info "暂无回滚包（首次会话结束后自动创建）"
-fi
 
 echo ""
 dt_info "会话已开始。工作完成后运行: devtrack 结束 \"本次做了什么\""
