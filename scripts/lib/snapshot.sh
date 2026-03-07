@@ -55,6 +55,23 @@ _snap_parse_remote_paths() {
     done < "$DEVTRACK_CONFIG"
 }
 
+_snap_has_nested_worktrees() {
+    [ -d "./.worktrees" ] || return 1
+    find "./.worktrees" -mindepth 2 -maxdepth 2 -name ".git" -print -quit 2>/dev/null | grep -q .
+}
+
+_snap_should_skip_exclude() {
+    local pattern="${1%/}"
+    case "$pattern" in
+        ".worktrees")
+            _snap_has_nested_worktrees
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 _snap_get_remote_host() {
     grep -A 5 '^remote:' "$DEVTRACK_CONFIG" 2>/dev/null | grep 'host:' | head -1 | sed -E 's/.*host:\s*"?([^"]*)"?.*/\1/' || true
 }
@@ -103,6 +120,7 @@ _snap_collect_all_files() {
     # 收集 exclude 规则（ignore_paths + exclude + extra）
     while IFS= read -r pattern; do
         [ -z "$pattern" ] && continue
+        _snap_should_skip_exclude "$pattern" && continue
         echo "$pattern" >> "$exclude_file"
     done < <(
         _snap_parse_ignore_paths
@@ -201,13 +219,40 @@ _snap_collect_all_files() {
     rm -f "$include_file" "$exclude_file"
 }
 
+_snap_sha_tsv_to_json() {
+    local tsv_file="$1"
+    jq -Rn '
+        [inputs
+         | select(length > 0)
+         | split("\t")
+         | {path: .[0], sha256: .[1]}]
+    ' < "$tsv_file"
+}
+
+_snap_backup_tsv_to_json() {
+    local tsv_file="$1"
+    jq -Rn '
+        [inputs
+         | select(length > 0)
+         | split("\t")
+         | {path: .[0], backup_rel: .[1], backup_sha256: .[2]}]
+    ' < "$tsv_file"
+}
+
+_snap_services_tsv_to_json() {
+    local tsv_file="$1"
+    jq -Rn '[inputs | select(length > 0)]' < "$tsv_file"
+}
+
 # snapshot_manifest_only <output_json> — 轻量：只记录文件路径和 SHA-256，不复制文件
 snapshot_manifest_only() {
     local out_file="$1"
     local project_root="$PWD"
-    local files_json_tmp
+    local files_json_tmp entries_tsv_tmp
     files_json_tmp="$(mktemp)"
+    entries_tsv_tmp="$(mktemp)"
     echo "[]" > "$files_json_tmp"
+    : > "$entries_tsv_tmp"
 
     while IFS= read -r relpath; do
         [ -z "$relpath" ] && continue
@@ -215,21 +260,22 @@ snapshot_manifest_only() {
         fullpath="$project_root/$relpath"
         [ -f "$fullpath" ] || continue
         sha="$(dt_sha256 "$fullpath")"
-        jq --arg p "$fullpath" --arg sha "$sha" \
-            '. + [{"path": $p, "sha256": $sha}]' "$files_json_tmp" > "${files_json_tmp}.new"
-        mv -f "${files_json_tmp}.new" "$files_json_tmp"
+        printf '%s\t%s\n' "$fullpath" "$sha" >> "$entries_tsv_tmp"
     done < <(_snap_collect_all_files)
+
+    _snap_sha_tsv_to_json "$entries_tsv_tmp" > "$files_json_tmp"
 
     jq -n --arg ts "$(dt_iso_timestamp)" --slurpfile files "$files_json_tmp" \
         '{created_at: $ts, local_files: $files[0]}' > "$out_file"
 
-    rm -f "$files_json_tmp"
+    rm -f "$files_json_tmp" "$entries_tsv_tmp"
 }
 
-# snapshot_create <output_dir> <description>
-snapshot_create() {
-    local out_dir="$1"
-    local desc="${2:-}"
+# snapshot_create_from_manifest <manifest_json> <output_dir> <description>
+snapshot_create_from_manifest() {
+    local manifest_file="$1"
+    local out_dir="$2"
+    local desc="${3:-}"
     local project_root="$PWD"
     local out_rel="$out_dir"
 
@@ -242,30 +288,37 @@ snapshot_create() {
 
     # 全量备份本地文件
     local local_files_json_tmp remote_files_json_tmp services_json_tmp
+    local local_entries_tsv remote_entries_tsv services_entries_tsv
     local_files_json_tmp="$(mktemp)"
     remote_files_json_tmp="$(mktemp)"
     services_json_tmp="$(mktemp)"
+    local_entries_tsv="$(mktemp)"
+    remote_entries_tsv="$(mktemp)"
+    services_entries_tsv="$(mktemp)"
     echo "[]" > "$local_files_json_tmp"
     echo "[]" > "$remote_files_json_tmp"
     echo "[]" > "$services_json_tmp"
+    : > "$local_entries_tsv"
+    : > "$remote_entries_tsv"
+    : > "$services_entries_tsv"
     local count=0
-    while IFS= read -r relpath; do
-        [ -z "$relpath" ] && continue
-        relpath="${relpath#./}"
-        fullpath="$project_root/$relpath"
-        [ -f "$fullpath" ] || continue
+    while IFS=$'\t' read -r fullpath sha; do
+        [ -n "$fullpath" ] || continue
 
+        relpath="${fullpath#$project_root/}"
+        [ "$relpath" = "$fullpath" ] && relpath="$(basename "$fullpath")"
         backup_rel="originals/local/$relpath"
         mkdir -p "$out_dir/$(dirname "$backup_rel")"
         cp "$fullpath" "$out_dir/$backup_rel"
 
-        sha="$(dt_sha256 "$fullpath")"
-        jq --arg p "$fullpath" --arg br "$backup_rel" --arg sha "$sha" \
-            '. + [{"path": $p, "backup_rel": $br, "backup_sha256": $sha}]' \
-            "$local_files_json_tmp" > "${local_files_json_tmp}.new"
-        mv -f "${local_files_json_tmp}.new" "$local_files_json_tmp"
+        printf '%s\t%s\t%s\n' "$fullpath" "$backup_rel" "$sha" >> "$local_entries_tsv"
         count=$((count + 1))
-    done < <(SNAPSHOT_EXTRA_EXCLUDES="$out_rel" _snap_collect_all_files)
+        if [ $((count % 500)) -eq 0 ]; then
+            dt_info "  已备份 $count 个本地文件..."
+        fi
+    done < <(jq -r '.local_files[] | [.path, .sha256] | @tsv' "$manifest_file")
+
+    _snap_backup_tsv_to_json "$local_entries_tsv" > "$local_files_json_tmp"
 
     # 远程文件
     r_host="$(_snap_get_remote_host)"
@@ -283,20 +336,19 @@ snapshot_create() {
             mkdir -p "$out_dir/$(dirname "$backup_rel")"
             if scp $ssh_opts "${r_user}@${r_host}:${rpath}" "$out_dir/$backup_rel" 2>/dev/null; then
                 sha="$(dt_sha256 "$out_dir/$backup_rel")"
-                jq --arg p "$rpath" --arg br "$backup_rel" --arg sha "$sha" \
-                    '. + [{"path": $p, "backup_rel": $br, "backup_sha256": $sha}]' \
-                    "$remote_files_json_tmp" > "${remote_files_json_tmp}.new"
-                mv -f "${remote_files_json_tmp}.new" "$remote_files_json_tmp"
+                printf '%s\t%s\t%s\n' "$rpath" "$backup_rel" "$sha" >> "$remote_entries_tsv"
             fi
         done < <(_snap_parse_remote_paths)
+        _snap_backup_tsv_to_json "$remote_entries_tsv" > "$remote_files_json_tmp"
     fi
 
     # 服务列表
     while IFS= read -r svc; do
         [ -z "$svc" ] && continue
-        jq --arg s "$svc" '. + [$s]' "$services_json_tmp" > "${services_json_tmp}.new"
-        mv -f "${services_json_tmp}.new" "$services_json_tmp"
+        printf '%s\n' "$svc" >> "$services_entries_tsv"
     done < <(_snap_get_remote_services)
+
+    _snap_services_tsv_to_json "$services_entries_tsv" > "$services_json_tmp"
 
     # manifest.json
     jq -n \
@@ -324,6 +376,7 @@ snapshot_create() {
         }' > "$out_dir/manifest.json"
 
     rm -f "$local_files_json_tmp" "$remote_files_json_tmp" "$services_json_tmp"
+    rm -f "$local_entries_tsv" "$remote_entries_tsv" "$services_entries_tsv"
 
     # state.yaml 快照
     [ -f "$DEVTRACK_STATE" ] && cp "$DEVTRACK_STATE" "$out_dir/state.yaml"
@@ -473,4 +526,15 @@ echo ""
 echo "=== 验证完成 ==="
 VERIFY_EOF
     chmod +x "$out_dir/verify.sh"
+}
+
+# snapshot_create <output_dir> <description>
+snapshot_create() {
+    local out_dir="$1"
+    local desc="${2:-}"
+    local manifest_tmp
+    manifest_tmp="$(mktemp)"
+    snapshot_manifest_only "$manifest_tmp"
+    snapshot_create_from_manifest "$manifest_tmp" "$out_dir" "$desc"
+    rm -f "$manifest_tmp"
 }

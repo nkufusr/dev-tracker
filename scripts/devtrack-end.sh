@@ -10,6 +10,14 @@ dt_require_init
 dt_require_jq
 
 summary="${*:-}"
+current_manifest=""
+rollback_tmp=""
+finish_ok=0
+added_files=""
+added_count=0
+changed_count=0
+deleted_count=0
+total_changes=0
 
 # 从 transcript.jsonl 提取对话摘要
 _extract_conversation() {
@@ -54,6 +62,37 @@ _extract_conversation() {
     } > "$output" 2>/dev/null
 }
 
+_update_session_meta() {
+    local status="$1"
+    local summary_text="$2"
+    local changed_total="${3:-0}"
+    [ -f "$SESSION_DIR/session.yaml" ] || return 0
+    local tmp
+    tmp="$(mktemp)"
+    sed -E "s|^ended_at:.*|ended_at: \"$(dt_iso_timestamp)\"|" "$SESSION_DIR/session.yaml" > "$tmp"
+    sed -i -E "s|^status:.*|status: \"${status}\"|" "$tmp"
+    sed -i -E "s|^summary:.*|summary: \"${summary_text}\"|" "$tmp"
+    sed -i -E "s|^files_changed:.*|files_changed: ${changed_total}|" "$tmp"
+    mv -f "$tmp" "$SESSION_DIR/session.yaml"
+}
+
+_cleanup_devtrack_end() {
+    local code=$?
+    trap - EXIT INT TERM
+    [ -n "$current_manifest" ] && rm -f "$current_manifest"
+    [ -n "$rollback_tmp" ] && [ -d "$rollback_tmp" ] && rm -rf "$rollback_tmp"
+
+    if [ "$finish_ok" -ne 1 ]; then
+        rm -f "$DEVTRACK_DIR/.active_session"
+        failure_summary="${summary:-devtrack 结束失败}"
+        _update_session_meta "failed" "$failure_summary" "$total_changes"
+    fi
+
+    exit "$code"
+}
+
+trap '_cleanup_devtrack_end' EXIT INT TERM
+
 if [ ! -f "$DEVTRACK_DIR/.active_session" ]; then
     dt_die "没有活跃会话。请先运行 'devtrack 开始'"
 fi
@@ -69,40 +108,61 @@ dt_info "=== 结束会话: $SESSION_ID ==="
 dt_info ""
 
 # ──────────────────────────────────────
-# 1) 对比变更（用开始时的基线 SHA-256）
+# 1) 对比变更（基线 + 当前清单）
 # ──────────────────────────────────────
 changed_files=""
 deleted_files=""
-changed_count=0
-deleted_count=0
+current_manifest="$(mktemp)"
+snapshot_manifest_only "$current_manifest"
 
 if [ -f "$BASELINE" ]; then
     dt_info "正在对比变更..."
+    declare -A baseline_sha=()
+    declare -A current_sha=()
+
     while IFS='|' read -r fpath expected_sha; do
-        if [ ! -f "$fpath" ]; then
-            deleted_files="${deleted_files}${fpath}\n"
-            deleted_count=$((deleted_count + 1))
+        [ -n "$fpath" ] || continue
+        baseline_sha["$fpath"]="$expected_sha"
+    done < <(jq -r '.local_files[] | "\(.path)|\(.sha256)"' "$BASELINE")
+
+    while IFS='|' read -r fpath observed_sha; do
+        [ -n "$fpath" ] || continue
+        current_sha["$fpath"]="$observed_sha"
+
+        if [ -z "${baseline_sha[$fpath]+x}" ]; then
+            added_files="${added_files}${fpath}\n"
+            added_count=$((added_count + 1))
             continue
         fi
-        current_sha="$(sha256sum "$fpath" | awk '{print $1}')"
-        if [ "$current_sha" != "$expected_sha" ]; then
+
+        if [ "${baseline_sha[$fpath]}" != "$observed_sha" ]; then
             changed_files="${changed_files}${fpath}\n"
             changed_count=$((changed_count + 1))
         fi
-    done < <(jq -r '.local_files[] | "\(.path)|\(.sha256)"' "$BASELINE")
+    done < <(jq -r '.local_files[] | "\(.path)|\(.sha256)"' "$current_manifest")
+
+    for fpath in "${!baseline_sha[@]}"; do
+        if [ -z "${current_sha[$fpath]+x}" ]; then
+            deleted_files="${deleted_files}${fpath}\n"
+            deleted_count=$((deleted_count + 1))
+        fi
+    done
 fi
 
-total_changes=$((changed_count + deleted_count))
-dt_info "本次会话变更: $changed_count 个文件修改, $deleted_count 个文件删除"
+total_changes=$((changed_count + deleted_count + added_count))
+dt_info "本次会话变更: $changed_count 个文件修改, $deleted_count 个文件删除, $added_count 个文件新增"
 
 # 自动摘要
 if [ -z "$summary" ]; then
     if [ "$total_changes" -gt 0 ]; then
-        if [ "$changed_count" -le 5 ] && [ "$changed_count" -gt 0 ]; then
+        if [ "$changed_count" -le 5 ] && [ "$changed_count" -gt 0 ] && [ "$added_count" -eq 0 ] && [ "$deleted_count" -eq 0 ]; then
             file_list="$(echo -e "$changed_files" | sed '/^$/d' | sed 's|.*/||' | tr '\n' ', ' | sed 's/,$//')"
             summary="修改了: $file_list"
+        elif [ "$added_count" -le 5 ] && [ "$added_count" -gt 0 ] && [ "$changed_count" -eq 0 ] && [ "$deleted_count" -eq 0 ]; then
+            file_list="$(echo -e "$added_files" | sed '/^$/d' | sed 's|.*/||' | tr '\n' ', ' | sed 's/,$//')"
+            summary="新增了: $file_list"
         else
-            summary="修改了 $changed_count 个文件"
+            summary="变更了 $total_changes 个文件"
         fi
     else
         summary="无文件变更"
@@ -121,6 +181,12 @@ EOF
 echo -e "$changed_files" | sed '/^$/d' | while IFS= read -r f; do
     echo "- $f" >> "$SESSION_DIR/changes.md"
 done
+if [ "$added_count" -gt 0 ]; then
+    echo -e "\n## 新增文件 ($added_count)" >> "$SESSION_DIR/changes.md"
+    echo -e "$added_files" | sed '/^$/d' | while IFS= read -r f; do
+        echo "- $f" >> "$SESSION_DIR/changes.md"
+    done
+fi
 if [ "$deleted_count" -gt 0 ]; then
     echo -e "\n## 删除文件 ($deleted_count)" >> "$SESSION_DIR/changes.md"
     echo -e "$deleted_files" | sed '/^$/d' | while IFS= read -r f; do
@@ -137,6 +203,11 @@ dt_info "正在创建全量回滚包..."
 # 读取保留数量（config: rollback_keep，默认 3）
 ROLLBACK_KEEP="$(grep -E '^rollback_keep:' "$DEVTRACK_CONFIG" 2>/dev/null | sed -E 's/rollback_keep:\s*//' | tr -d '"' || true)"
 ROLLBACK_KEEP="${ROLLBACK_KEEP:-3}"
+
+# 先在临时目录构建新的 rollback，成功后再替换当前有效包
+rollback_tmp="$(mktemp -d "$DEVTRACK_DIR/rollback.tmp.XXXXXX")"
+snapshot_create_from_manifest "$current_manifest" "$rollback_tmp" "会话 $SESSION_ID 结束时的全量备份 — $summary"
+[ -f "$rollback_tmp/manifest.json" ] || dt_die "新回滚包未生成 manifest.json"
 
 # 把当前 rollback/ 轮转到 rollback.1/、rollback.2/ ... rollback.N/
 # 先删最旧的
@@ -155,8 +226,9 @@ done
 # 当前 rollback/ 移到 rollback.1/
 [ -d "$ROLLBACK_DIR" ] && mv "$ROLLBACK_DIR" "$DEVTRACK_DIR/rollback.1"
 
-# 创建新的 rollback/
-snapshot_create "$ROLLBACK_DIR" "会话 $SESSION_ID 结束时的全量备份 — $summary"
+# 提升新包为当前有效 rollback
+mv "$rollback_tmp" "$ROLLBACK_DIR"
+rollback_tmp=""
 
 local_count="$(jq '.local_files | length' "$ROLLBACK_DIR/manifest.json")"
 remote_count="$(jq '.remote_files | length' "$ROLLBACK_DIR/manifest.json" 2>/dev/null || echo 0)"
@@ -182,12 +254,7 @@ done
 # ──────────────────────────────────────
 # 3) 更新会话元数据
 # ──────────────────────────────────────
-tmp="$(mktemp)"
-sed -E "s|^ended_at:.*|ended_at: \"$(dt_iso_timestamp)\"|" "$SESSION_DIR/session.yaml" > "$tmp"
-sed -i -E "s|^status:.*|status: \"completed\"|" "$tmp"
-sed -i -E "s|^summary:.*|summary: \"$summary\"|" "$tmp"
-sed -i -E "s|^files_changed:.*|files_changed: $total_changes|" "$tmp"
-mv -f "$tmp" "$SESSION_DIR/session.yaml"
+_update_session_meta "completed" "$summary" "$total_changes"
 
 # ──────────────────────────────────────
 # 4) 从 activity log 补充信息（如果 hooks 有捕获）
@@ -234,3 +301,5 @@ dt_info "回滚包代表当前的可用状态。下次出问题时:"
 dt_info "  devtrack 回滚            预演"
 dt_info "  devtrack 回滚 --apply    执行恢复"
 dt_info "  $ROLLBACK_DIR/verify.sh  验证回滚结果"
+
+finish_ok=1
