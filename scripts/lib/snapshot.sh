@@ -13,6 +13,33 @@ _snap_parse_excludes() {
     done < "$DEVTRACK_CONFIG"
 }
 
+_snap_parse_tracking_list() {
+    local key="$1"
+    local in_tracking=0
+    local in_list=0
+
+    while IFS= read -r line; do
+        echo "$line" | grep -qE '^tracking:' && { in_tracking=1; in_list=0; continue; }
+        if [ "$in_tracking" -eq 1 ]; then
+            echo "$line" | grep -qE '^[^[:space:]]' && { in_tracking=0; in_list=0; continue; }
+            echo "$line" | grep -qE "^\\s+${key}:" && { in_list=1; continue; }
+            if [ "$in_list" -eq 1 ]; then
+                echo "$line" | grep -qE '^\s+[A-Za-z_][A-Za-z0-9_]*:' && { in_list=0; continue; }
+                echo "$line" | grep -qE '^\s+- ' && \
+                    echo "$line" | sed -E 's/^\s+- "?([^"]*)"?$/\1/'
+            fi
+        fi
+    done < "$DEVTRACK_CONFIG"
+}
+
+_snap_parse_local_paths() {
+    _snap_parse_tracking_list "local_paths"
+}
+
+_snap_parse_ignore_paths() {
+    _snap_parse_tracking_list "ignore_paths"
+}
+
 _snap_parse_remote_paths() {
     local in_remote=0 in_paths=0
     while IFS= read -r line; do
@@ -58,36 +85,103 @@ _snap_get_command() {
 
 # 收集所有文件（全量，排除 build 产物）
 _snap_collect_all_files() {
-    local exclude_file
+    local include_file exclude_file
+    local filepath_rel pattern_rel
     exclude_file="$(mktemp)"
+    include_file="$(mktemp)"
+    local prune_dirs=()
 
     while IFS= read -r pattern; do
         [ -z "$pattern" ] && continue
-        # 去掉尾部 / 和通配符前缀
+        echo "$pattern" >> "$include_file"
+    done < <(_snap_parse_local_paths)
+
+    while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        pattern="${pattern%/}"
+        pattern="${pattern#\*/}"
+        echo "$pattern" >> "$exclude_file"
+    done < <(_snap_parse_ignore_paths)
+
+    while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
         pattern="${pattern%/}"
         pattern="${pattern#\*/}"
         echo "$pattern" >> "$exclude_file"
     done < <(_snap_parse_excludes)
 
-    find . -type f | while IFS= read -r filepath; do
+    if [ -n "${SNAPSHOT_EXTRA_EXCLUDES:-}" ]; then
+        while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            pattern="${pattern%/}"
+            echo "$pattern" >> "$exclude_file"
+        done << EOF
+${SNAPSHOT_EXTRA_EXCLUDES}
+EOF
+    fi
+
+    while IFS= read -r excl; do
+        [ -z "$excl" ] && continue
+        case "$excl" in
+            *'*'*|*'?'*|*'['*) continue ;;
+        esac
+        prune_dirs+=("${excl#./}")
+    done < "$exclude_file"
+
+    local find_cmd=(find .)
+    if [ "${#prune_dirs[@]}" -gt 0 ]; then
+        find_cmd+=( "(" )
+        local first=1
+        local dir
+        for dir in "${prune_dirs[@]}"; do
+            [ -z "$dir" ] && continue
+            if [ "$first" -eq 0 ]; then
+                find_cmd+=( -o )
+            fi
+            find_cmd+=( -path "./$dir" -o -path "./$dir/*" )
+            first=0
+        done
+        find_cmd+=( ")" -prune -o )
+    fi
+    find_cmd+=( -type f -print )
+
+    "${find_cmd[@]}" | while IFS= read -r filepath; do
+        filepath_rel="${filepath#./}"
         local skip=0
         while IFS= read -r excl; do
-            case "$filepath" in
-                */"$excl"/*|*/"$excl"|./"$excl"/*|./"$excl")
+            [ -z "$excl" ] && continue
+            pattern_rel="${excl#./}"
+            pattern_rel="${pattern_rel%/}"
+            case "$filepath_rel" in
+                "$pattern_rel"|"$pattern_rel"/*|$pattern_rel)
                     skip=1; break ;;
             esac
-            # 通配符模式匹配（如 *.class）
-            case "$excl" in
-                \*.*)
-                    ext="${excl#\*}"
-                    case "$filepath" in
-                        *"$ext") skip=1; break ;;
-                    esac ;;
+            case "$filepath_rel" in
+                $pattern_rel)
+                    skip=1; break ;;
             esac
         done < "$exclude_file"
-        [ "$skip" -eq 0 ] && echo "$filepath"
+
+        [ "$skip" -eq 1 ] && continue
+
+        if [ -s "$include_file" ]; then
+            local matched=0
+            while IFS= read -r inc; do
+                [ -z "$inc" ] && continue
+                pattern_rel="${inc#./}"
+                pattern_rel="${pattern_rel%/}"
+                case "$filepath_rel" in
+                    $pattern_rel)
+                        matched=1; break ;;
+                esac
+            done < "$include_file"
+            [ "$matched" -eq 1 ] || continue
+        fi
+
+        echo "$filepath"
     done | sort
 
+    rm -f "$include_file"
     rm -f "$exclude_file"
 }
 
@@ -95,7 +189,9 @@ _snap_collect_all_files() {
 snapshot_manifest_only() {
     local out_file="$1"
     local project_root="$PWD"
-    local files_json="[]"
+    local files_json_tmp
+    files_json_tmp="$(mktemp)"
+    echo "[]" > "$files_json_tmp"
 
     while IFS= read -r relpath; do
         [ -z "$relpath" ] && continue
@@ -103,12 +199,15 @@ snapshot_manifest_only() {
         fullpath="$project_root/$relpath"
         [ -f "$fullpath" ] || continue
         sha="$(dt_sha256 "$fullpath")"
-        files_json="$(echo "$files_json" | jq --arg p "$fullpath" --arg sha "$sha" \
-            '. + [{"path": $p, "sha256": $sha}]')"
+        jq --arg p "$fullpath" --arg sha "$sha" \
+            '. + [{"path": $p, "sha256": $sha}]' "$files_json_tmp" > "${files_json_tmp}.new"
+        mv -f "${files_json_tmp}.new" "$files_json_tmp"
     done < <(_snap_collect_all_files)
 
-    jq -n --arg ts "$(dt_iso_timestamp)" --argjson files "$files_json" \
-        '{created_at: $ts, local_files: $files}' > "$out_file"
+    jq -n --arg ts "$(dt_iso_timestamp)" --slurpfile files "$files_json_tmp" \
+        '{created_at: $ts, local_files: $files[0]}' > "$out_file"
+
+    rm -f "$files_json_tmp"
 }
 
 # snapshot_create <output_dir> <description>
@@ -116,11 +215,23 @@ snapshot_create() {
     local out_dir="$1"
     local desc="${2:-}"
     local project_root="$PWD"
+    local out_rel="$out_dir"
 
     mkdir -p "$out_dir/originals/local"
 
+    case "$out_rel" in
+        "$project_root"/*) out_rel="${out_rel#$project_root/}" ;;
+    esac
+    out_rel="${out_rel#./}"
+
     # 全量备份本地文件
-    local local_files_json="[]"
+    local local_files_json_tmp remote_files_json_tmp services_json_tmp
+    local_files_json_tmp="$(mktemp)"
+    remote_files_json_tmp="$(mktemp)"
+    services_json_tmp="$(mktemp)"
+    echo "[]" > "$local_files_json_tmp"
+    echo "[]" > "$remote_files_json_tmp"
+    echo "[]" > "$services_json_tmp"
     local count=0
     while IFS= read -r relpath; do
         [ -z "$relpath" ] && continue
@@ -133,13 +244,14 @@ snapshot_create() {
         cp "$fullpath" "$out_dir/$backup_rel"
 
         sha="$(dt_sha256 "$fullpath")"
-        local_files_json="$(echo "$local_files_json" | jq --arg p "$fullpath" --arg br "$backup_rel" --arg sha "$sha" \
-            '. + [{"path": $p, "backup_rel": $br, "backup_sha256": $sha}]')"
+        jq --arg p "$fullpath" --arg br "$backup_rel" --arg sha "$sha" \
+            '. + [{"path": $p, "backup_rel": $br, "backup_sha256": $sha}]' \
+            "$local_files_json_tmp" > "${local_files_json_tmp}.new"
+        mv -f "${local_files_json_tmp}.new" "$local_files_json_tmp"
         count=$((count + 1))
-    done < <(_snap_collect_all_files)
+    done < <(SNAPSHOT_EXTRA_EXCLUDES="$out_rel" _snap_collect_all_files)
 
     # 远程文件
-    local remote_files_json="[]"
     r_host="$(_snap_get_remote_host)"
     r_user="$(_snap_get_remote_user)"
     r_key="$(_snap_get_remote_ssh_key)"
@@ -155,18 +267,19 @@ snapshot_create() {
             mkdir -p "$out_dir/$(dirname "$backup_rel")"
             if scp $ssh_opts "${r_user}@${r_host}:${rpath}" "$out_dir/$backup_rel" 2>/dev/null; then
                 sha="$(dt_sha256 "$out_dir/$backup_rel")"
-                remote_files_json="$(echo "$remote_files_json" | jq \
-                    --arg p "$rpath" --arg br "$backup_rel" --arg sha "$sha" \
-                    '. + [{"path": $p, "backup_rel": $br, "backup_sha256": $sha}]')"
+                jq --arg p "$rpath" --arg br "$backup_rel" --arg sha "$sha" \
+                    '. + [{"path": $p, "backup_rel": $br, "backup_sha256": $sha}]' \
+                    "$remote_files_json_tmp" > "${remote_files_json_tmp}.new"
+                mv -f "${remote_files_json_tmp}.new" "$remote_files_json_tmp"
             fi
         done < <(_snap_parse_remote_paths)
     fi
 
     # 服务列表
-    services_json="[]"
     while IFS= read -r svc; do
         [ -z "$svc" ] && continue
-        services_json="$(echo "$services_json" | jq --arg s "$svc" '. + [$s]')"
+        jq --arg s "$svc" '. + [$s]' "$services_json_tmp" > "${services_json_tmp}.new"
+        mv -f "${services_json_tmp}.new" "$services_json_tmp"
     done < <(_snap_get_remote_services)
 
     # manifest.json
@@ -180,19 +293,21 @@ snapshot_create() {
         --arg build "$(_snap_get_command build)" \
         --arg test "$(_snap_get_command test)" \
         --arg health "$(_snap_get_command health)" \
-        --argjson services "$services_json" \
-        --argjson local_files "$local_files_json" \
-        --argjson remote_files "$remote_files_json" \
+        --slurpfile services "$services_json_tmp" \
+        --slurpfile local_files "$local_files_json_tmp" \
+        --slurpfile remote_files "$remote_files_json_tmp" \
         '{
             created_at: $ts,
             description: $desc,
             workspace_root: $root,
             server: {host: $rhost, user: $ruser, ssh_key_default: $rkey},
             commands: {build: $build, test: $test, health: $health},
-            services_to_restart: $services,
-            local_files: $local_files,
-            remote_files: $remote_files
+            services_to_restart: $services[0],
+            local_files: $local_files[0],
+            remote_files: $remote_files[0]
         }' > "$out_dir/manifest.json"
+
+    rm -f "$local_files_json_tmp" "$remote_files_json_tmp" "$services_json_tmp"
 
     # state.yaml 快照
     [ -f "$DEVTRACK_STATE" ] && cp "$DEVTRACK_STATE" "$out_dir/state.yaml"
