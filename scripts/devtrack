@@ -43,6 +43,7 @@ case "$cmd" in
     rollback|回滚)    exec "$SCRIPT_DIR/devtrack-rollback.sh" "$@" ;;
     init|初始化)      exec "$SCRIPT_DIR/devtrack-init.sh" "$@" ;;
     status|状态)      exec "$SCRIPT_DIR/devtrack-status.sh" "$@" ;;
+    hook)             exec "$SCRIPT_DIR/devtrack-hook.sh" "$@" ;;
     -h|--help|help|帮助) usage; exit 0 ;;
     *)  echo "未知命令: $cmd" >&2; usage >&2; exit 1 ;;
 esac

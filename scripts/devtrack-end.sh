@@ -11,6 +11,49 @@ dt_require_jq
 
 summary="${*:-}"
 
+# 从 transcript.jsonl 提取对话摘要
+_extract_conversation() {
+    local transcript="$1"
+    local output="$2"
+    [ -f "$transcript" ] || return 0
+
+    {
+        echo "# 对话摘要"
+        echo ""
+        local turn=0
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            role="$(echo "$line" | jq -r '.role // ""' 2>/dev/null)"
+            [ -z "$role" ] && continue
+
+            if [ "$role" = "user" ]; then
+                content="$(echo "$line" | jq -r '
+                    if (.content | type) == "string" then .content
+                    elif (.content | type) == "array" then
+                        [.content[] | select(.type == "text") | .text] | join(" ")
+                    else "" end
+                ' 2>/dev/null | tr '\n' ' ' | head -c 200)"
+                if [ -n "$content" ]; then
+                    turn=$((turn + 1))
+                    echo "**[用户]** $content"
+                    echo ""
+                fi
+            elif [ "$role" = "assistant" ]; then
+                content="$(echo "$line" | jq -r '
+                    if (.content | type) == "string" then .content
+                    elif (.content | type) == "array" then
+                        [.content[] | select(.type == "text") | .text] | join(" ")
+                    else "" end
+                ' 2>/dev/null | tr '\n' ' ' | head -c 300)"
+                if [ -n "$content" ]; then
+                    echo "**[AI]** $content"
+                    echo ""
+                fi
+            fi
+        done < "$transcript"
+    } > "$output" 2>/dev/null
+}
+
 if [ ! -f "$DEVTRACK_DIR/.active_session" ]; then
     dt_die "没有活跃会话。请先运行 'devtrack 开始'"
 fi
@@ -147,7 +190,30 @@ sed -i -E "s|^files_changed:.*|files_changed: $total_changes|" "$tmp"
 mv -f "$tmp" "$SESSION_DIR/session.yaml"
 
 # ──────────────────────────────────────
-# 4) 收尾
+# 4) 从 activity log 补充信息（如果 hooks 有捕获）
+# ──────────────────────────────────────
+ACTIVITY_LOG="$SESSION_DIR/activity.jsonl"
+if [ -f "$ACTIVITY_LOG" ]; then
+    # 从 activity log 统计实际操作数
+    hook_writes="$(jq -r 'select(.event == "write" or .event == "edit")' "$ACTIVITY_LOG" 2>/dev/null | wc -l)"
+    hook_cmds="$(jq -r 'select(.event == "bash")' "$ACTIVITY_LOG" 2>/dev/null | wc -l)"
+    [ "$hook_writes" -gt 0 ] || [ "$hook_cmds" -gt 0 ] && \
+        dt_info "  操作日志: 文件写入/编辑 $hook_writes 次, 命令执行 $hook_cmds 次"
+
+    # 如果 Stop hook 捕获了 transcript，生成对话摘要
+    transcript_ref="$(jq -r 'select(.event == "stop") | .transcript' "$ACTIVITY_LOG" 2>/dev/null | tail -1)"
+    if [ -n "$transcript_ref" ] && [ -f "$transcript_ref" ] && [ ! -f "$SESSION_DIR/transcript.jsonl" ]; then
+        cp "$transcript_ref" "$SESSION_DIR/transcript.jsonl" 2>/dev/null || true
+    fi
+fi
+
+# 生成对话摘要（如有 transcript）
+if [ -f "$SESSION_DIR/transcript.jsonl" ] && [ ! -f "$SESSION_DIR/conversation.md" ]; then
+    _extract_conversation "$SESSION_DIR/transcript.jsonl" "$SESSION_DIR/conversation.md"
+fi
+
+# ──────────────────────────────────────
+# 5) 收尾
 # ──────────────────────────────────────
 rm -f "$DEVTRACK_DIR/.active_session"
 

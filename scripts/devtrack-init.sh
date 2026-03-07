@@ -161,7 +161,18 @@ EOF
 fi
 
 dt_info "dev-tracker 已初始化于 .devtrack/"
+
+# 安装 Claude Code hooks（自动捕获 AI 操作记录）
+source "$SCRIPT_DIR/lib/hooks-install.sh" 2>/dev/null || true
+if command -v jq >/dev/null 2>&1; then
+    if install_claude_hooks 2>/dev/null; then
+        if check_claude_hooks; then
+            dt_info "已安装 Claude Code hooks (.claude/settings.json)"
+            dt_info "  AI 的每次文件写入/命令执行将自动记录到会话日志"
+        fi
+    fi
+fi
+
 dt_info "后续步骤:"
 dt_info "  1. 编辑 .devtrack/config.yaml 设置追踪路径、构建命令、远程服务器"
-dt_info "  2. 编辑 .devtrack/state.yaml 设置当前任务和焦点"
-dt_info "  3. 运行 'devtrack 检查点 <标签>' 创建第一个快照"
+dt_info "  2. 运行 'devtrack 开始' 开始会话"

@@ -133,6 +133,48 @@ set +e
             done
         fi
         echo ""
+
+        # ── 活动时间线（来自 hooks 自动捕获）──
+        if [ -f "$last_dir/activity.jsonl" ]; then
+            local has_events=0
+            # 提取用户提示和文件操作（最多 8 条）
+            local timeline=""
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                evt="$(echo "$line" | jq -r '.event // ""' 2>/dev/null)"
+                ts_raw="$(echo "$line" | jq -r '.ts // ""' 2>/dev/null)"
+                ts_short="${ts_raw#*T}"  # 只取时间部分 HH:MM:SS
+
+                case "$evt" in
+                    user_prompt)
+                        prompt="$(echo "$line" | jq -r '.prompt // ""' 2>/dev/null | head -c 80)"
+                        [ -n "$prompt" ] && timeline="${timeline}- $ts_short [用户] $prompt\n" && has_events=1 ;;
+                    write)
+                        file="$(echo "$line" | jq -r '.file // ""' 2>/dev/null)"
+                        [ -n "$file" ] && timeline="${timeline}- $ts_short 写入: $file\n" && has_events=1 ;;
+                    edit)
+                        file="$(echo "$line" | jq -r '.file // ""' 2>/dev/null)"
+                        [ -n "$file" ] && timeline="${timeline}- $ts_short 编辑: $file\n" && has_events=1 ;;
+                    bash)
+                        cmd="$(echo "$line" | jq -r '.cmd // ""' 2>/dev/null | head -c 60)"
+                        [ -n "$cmd" ] && timeline="${timeline}- $ts_short 执行: $cmd\n" && has_events=1 ;;
+                esac
+            done < "$last_dir/activity.jsonl"
+
+            if [ "$has_events" -eq 1 ] && [ -n "$timeline" ]; then
+                echo "### 操作时间线（自动捕获）"
+                echo -e "$timeline" | head -8 | sed '/^$/d'
+                echo ""
+            fi
+        fi
+
+        # ── 对话摘要（来自 transcript 提取）──
+        if [ "$brief" -eq 0 ] && [ -f "$last_dir/conversation.md" ] && [ -s "$last_dir/conversation.md" ]; then
+            echo "### 上次对话摘要"
+            # 只显示前 15 行
+            head -15 "$last_dir/conversation.md" | grep -v "^# \|^会话:" | sed '/^$/d' | head -10
+            echo ""
+        fi
     fi
 
     # ── 2. 当前回滚包（确认可回滚的基线） ──
