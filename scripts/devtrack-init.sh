@@ -57,23 +57,44 @@ project:
   name: "$project_name"
   root: "$PWD"
 
-tracking:
-  local_paths:
-    - "**/*.kt"
-    - "**/*.java"
-    - "**/*.py"
-    - "**/*.js"
-    - "**/*.ts"
-    - "**/build.gradle.kts"
-    - "**/build.gradle"
-    - "**/package.json"
-    - "**/requirements.txt"
-  ignore_paths:
-    - "build/"
-    - ".gradle/"
-    - "node_modules/"
-    - "*.class"
-    - ".devtrack/"
+# 全量备份，排除以下（build 产物、依赖、二进制、大文件）
+exclude:
+  # devtrack 自身
+  - ".devtrack/"
+  # Gradle / Android
+  - "build/"
+  - "*/build/"
+  - ".gradle/"
+  - "*/.gradle/"
+  - "*.class"
+  - "*.apk"
+  - "*.aab"
+  - "*.dex"
+  - "*.jar"
+  - "*.aar"
+  - ".idea/"
+  - "*.iml"
+  - "local.properties"
+  # Python
+  - ".venv/"
+  - "__pycache__/"
+  - "*.pyc"
+  - "*.pyo"
+  - ".pytest_cache/"
+  # Node.js
+  - "node_modules/"
+  - ".npm/"
+  # 发布包/大二进制
+  - "*.zip"
+  - "*.tar.gz"
+  - "*.tar.bz2"
+  - "*.so"
+  - "*.o"
+  # 密钥
+  - "key/"
+  - "*.pem"
+  - "*.p12"
+  - "*.keystore"
 EOF
 
     if [ -n "$remote_host" ]; then

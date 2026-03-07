@@ -84,95 +84,112 @@ _snap_get_command() {
 }
 
 # 收集所有文件（全量，排除 build 产物）
+# 排除规则支持：
+#   dir/          → 精确目录名（任意层级）
+#   */dir/        → 任意父目录下的 dir（如 */build/ 匹配 app/build/）
+#   *.ext         → 扩展名通配（如 *.pyc）
+#   explicit/path → 精确路径
 _snap_collect_all_files() {
     local include_file exclude_file
-    local filepath_rel pattern_rel
     exclude_file="$(mktemp)"
     include_file="$(mktemp)"
-    local prune_dirs=()
 
+    # 收集 include 规则（local_paths）
     while IFS= read -r pattern; do
         [ -z "$pattern" ] && continue
         echo "$pattern" >> "$include_file"
     done < <(_snap_parse_local_paths)
 
+    # 收集 exclude 规则（ignore_paths + exclude + extra）
     while IFS= read -r pattern; do
         [ -z "$pattern" ] && continue
-        pattern="${pattern%/}"
-        pattern="${pattern#\*/}"
         echo "$pattern" >> "$exclude_file"
-    done < <(_snap_parse_ignore_paths)
+    done < <(
+        _snap_parse_ignore_paths
+        _snap_parse_excludes
+        [ -n "${SNAPSHOT_EXTRA_EXCLUDES:-}" ] && printf '%s\n' "${SNAPSHOT_EXTRA_EXCLUDES}"
+    )
 
+    # 构建 find prune 参数（加速：让 find 直接跳过排除目录）
+    local find_prune_args=()
     while IFS= read -r pattern; do
         [ -z "$pattern" ] && continue
-        pattern="${pattern%/}"
-        pattern="${pattern#\*/}"
-        echo "$pattern" >> "$exclude_file"
-    done < <(_snap_parse_excludes)
-
-    if [ -n "${SNAPSHOT_EXTRA_EXCLUDES:-}" ]; then
-        while IFS= read -r pattern; do
-            [ -z "$pattern" ] && continue
-            pattern="${pattern%/}"
-            echo "$pattern" >> "$exclude_file"
-        done << EOF
-${SNAPSHOT_EXTRA_EXCLUDES}
-EOF
-    fi
-
-    while IFS= read -r excl; do
-        [ -z "$excl" ] && continue
-        case "$excl" in
-            *'*'*|*'?'*|*'['*) continue ;;
+        pattern="${pattern%/}"   # 去尾部斜线
+        case "$pattern" in
+            # 扩展名模式（*.pyc）→ 不能 prune 目录，跳过
+            \*.*) continue ;;
+            # 顶级目录（build）→ -path ./build
+            */*) ;;  # 有路径分隔符的后面处理
+            *)
+                if [ ${#find_prune_args[@]} -gt 0 ]; then
+                    find_prune_args+=( -o )
+                fi
+                find_prune_args+=( -path "./$pattern" )
+                ;;
         esac
-        prune_dirs+=("${excl#./}")
+    done < "$exclude_file"
+
+    # 带通配符的目录模式（*/build → -path "*/build"）也加入 prune
+    while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        pattern="${pattern%/}"
+        case "$pattern" in
+            \*.*) continue ;;
+            */*)
+                if [ ${#find_prune_args[@]} -gt 0 ]; then
+                    find_prune_args+=( -o )
+                fi
+                find_prune_args+=( -path "./$pattern" )
+                ;;
+        esac
     done < "$exclude_file"
 
     local find_cmd=(find .)
-    if [ "${#prune_dirs[@]}" -gt 0 ]; then
-        find_cmd+=( "(" )
-        local first=1
-        local dir
-        for dir in "${prune_dirs[@]}"; do
-            [ -z "$dir" ] && continue
-            if [ "$first" -eq 0 ]; then
-                find_cmd+=( -o )
-            fi
-            find_cmd+=( -path "./$dir" -o -path "./$dir/*" )
-            first=0
-        done
-        find_cmd+=( ")" -prune -o )
+    if [ "${#find_prune_args[@]}" -gt 0 ]; then
+        find_cmd+=( "(" "${find_prune_args[@]}" ")" -prune -o )
     fi
     find_cmd+=( -type f -print )
 
     "${find_cmd[@]}" | while IFS= read -r filepath; do
-        filepath_rel="${filepath#./}"
+        local filepath_rel="${filepath#./}"
         local skip=0
+
         while IFS= read -r excl; do
             [ -z "$excl" ] && continue
-            pattern_rel="${excl#./}"
-            pattern_rel="${pattern_rel%/}"
-            case "$filepath_rel" in
-                "$pattern_rel"|"$pattern_rel"/*|$pattern_rel)
-                    skip=1; break ;;
-            esac
-            case "$filepath_rel" in
-                $pattern_rel)
-                    skip=1; break ;;
+            local p="${excl%/}"  # 去尾部斜线
+
+            case "$p" in
+                # 扩展名模式 *.ext
+                \*.*)
+                    case "$filepath_rel" in
+                        $p|*/$p) skip=1; break ;;
+                    esac
+                    ;;
+                # 带通配前缀 */dir
+                */*)
+                    case "$filepath_rel" in
+                        $p|$p/*) skip=1; break ;;
+                    esac
+                    ;;
+                # 简单目录名或路径
+                *)
+                    case "$filepath_rel" in
+                        "$p"|"$p"/*) skip=1; break ;;
+                    esac
+                    ;;
             esac
         done < "$exclude_file"
 
         [ "$skip" -eq 1 ] && continue
 
+        # include 过滤（如果有 local_paths 配置）
         if [ -s "$include_file" ]; then
             local matched=0
             while IFS= read -r inc; do
                 [ -z "$inc" ] && continue
-                pattern_rel="${inc#./}"
-                pattern_rel="${pattern_rel%/}"
+                local ip="${inc%/}"
                 case "$filepath_rel" in
-                    $pattern_rel)
-                        matched=1; break ;;
+                    $ip|$ip/*) matched=1; break ;;
                 esac
             done < "$include_file"
             [ "$matched" -eq 1 ] || continue
@@ -181,8 +198,7 @@ EOF
         echo "$filepath"
     done | sort
 
-    rm -f "$include_file"
-    rm -f "$exclude_file"
+    rm -f "$include_file" "$exclude_file"
 }
 
 # snapshot_manifest_only <output_json> — 轻量：只记录文件路径和 SHA-256，不复制文件

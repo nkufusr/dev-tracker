@@ -86,15 +86,33 @@ if [ "$deleted_count" -gt 0 ]; then
 fi
 
 # ──────────────────────────────────────
-# 2) 创建全量回滚包（替代旧包）
+# 2) 轮转旧回滚包 + 创建新全量回滚包
 # ──────────────────────────────────────
 dt_info ""
 dt_info "正在创建全量回滚包..."
 
-if [ -d "$ROLLBACK_DIR" ]; then
-    rm -rf "$ROLLBACK_DIR"
-fi
+# 读取保留数量（config: rollback_keep，默认 3）
+ROLLBACK_KEEP="$(grep -E '^rollback_keep:' "$DEVTRACK_CONFIG" 2>/dev/null | sed -E 's/rollback_keep:\s*//' | tr -d '"' || true)"
+ROLLBACK_KEEP="${ROLLBACK_KEEP:-3}"
 
+# 把当前 rollback/ 轮转到 rollback.1/、rollback.2/ ... rollback.N/
+# 先删最旧的
+oldest_slot="$DEVTRACK_DIR/rollback.${ROLLBACK_KEEP}"
+[ -d "$oldest_slot" ] && rm -rf "$oldest_slot"
+
+# 向后移动各个 slot
+i="$((ROLLBACK_KEEP - 1))"
+while [ "$i" -ge 1 ]; do
+    src="$DEVTRACK_DIR/rollback.$i"
+    dst="$DEVTRACK_DIR/rollback.$((i + 1))"
+    [ -d "$src" ] && mv "$src" "$dst"
+    i="$((i - 1))"
+done
+
+# 当前 rollback/ 移到 rollback.1/
+[ -d "$ROLLBACK_DIR" ] && mv "$ROLLBACK_DIR" "$DEVTRACK_DIR/rollback.1"
+
+# 创建新的 rollback/
 snapshot_create "$ROLLBACK_DIR" "会话 $SESSION_ID 结束时的全量备份 — $summary"
 
 local_count="$(jq '.local_files | length' "$ROLLBACK_DIR/manifest.json")"
@@ -105,6 +123,18 @@ dt_info "回滚包已就绪:"
 dt_info "  本地文件: $local_count 个"
 [ "$remote_count" -gt 0 ] && dt_info "  远程文件: $remote_count 个"
 dt_info "  包大小: $pkg_size"
+
+# 显示历史回滚包
+slot_count=0
+for i in $(seq 1 "$ROLLBACK_KEEP"); do
+    slot="$DEVTRACK_DIR/rollback.$i"
+    [ -d "$slot" ] && [ -f "$slot/manifest.json" ] || continue
+    slot_desc="$(jq -r '.description // "旧备份"' "$slot/manifest.json" | sed 's/ — .*//')"
+    slot_time="$(jq -r '.created_at' "$slot/manifest.json")"
+    [ "$slot_count" -eq 0 ] && dt_info "  历史回滚包:"
+    dt_info "    rollback.$i: $slot_time"
+    slot_count=$((slot_count + 1))
+done
 
 # ──────────────────────────────────────
 # 3) 更新会话元数据
