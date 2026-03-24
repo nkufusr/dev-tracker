@@ -20,7 +20,7 @@ description: Use when starting a new AI conversation on any project to load deve
 | 命令 | 功能 |
 |------|------|
 | `devtrack 开始` | 自动快照当前状态 + 生成 AI 上下文 |
-| `devtrack 结束 [摘要]` | 自动保存所有变更 + 记录差异 |
+| `devtrack 结束 [摘要]` | 自动保存所有变更 + 记录差异；若无活跃会话但检测到真实改动，会提示补录并继续结束 |
 | `devtrack 回滚` | 恢复到上次会话开始前（默认预演，--apply 执行） |
 
 ## AI Integration Rules
@@ -28,11 +28,13 @@ description: Use when starting a new AI conversation on any project to load deve
 1. **每次新对话**: 若 `.devtrack/` 存在，先运行 `devtrack 开始`
 2. **结束工作时**: 运行 `devtrack 结束 "简述本次工作"`，AI 应主动提醒
 3. **回滚**: `devtrack 回滚` 预演，确认后 `devtrack 回滚 --apply`
+4. **补录结束**: 若 `devtrack 结束` 提示“没有活跃会话”但检测到真实改动，AI 应向用户说明这是补录场景，并在用户确认后继续结束
 
 ## How It Works
 
 `devtrack 开始` 自动快照所有追踪文件（本地+远程），然后输出上下文摘要。
 `devtrack 结束` 再次快照，自动对比找出变更/新增/删除的文件并记录。
+如果没有活跃会话，但相对最近一次已完成会话存在真实变更，`devtrack 结束` 会提示是否创建补录会话并继续完成收尾。
 `devtrack 回滚` 从"开始前快照"恢复所有文件到会话开始前的状态。
 
 每个会话存储在 `.devtrack/sessions/<timestamp>/`:

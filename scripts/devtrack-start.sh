@@ -25,7 +25,7 @@ if [ -f "$DEVTRACK_DIR/.active_session" ]; then
     rm -f "$DEVTRACK_DIR/.active_session"
 fi
 
-SESSION_ID="$(dt_timestamp)"
+SESSION_ID="$(dt_new_session_id)"
 SESSION_DIR="$DEVTRACK_SESSIONS/$SESSION_ID"
 mkdir -p "$SESSION_DIR"
 

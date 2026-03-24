@@ -18,6 +18,8 @@ added_count=0
 changed_count=0
 deleted_count=0
 total_changes=0
+precomputed_diff=0
+backfill_from=""
 
 # 从 transcript.jsonl 提取对话摘要
 _extract_conversation() {
@@ -93,37 +95,30 @@ _cleanup_devtrack_end() {
 
 trap '_cleanup_devtrack_end' EXIT INT TERM
 
-if [ ! -f "$DEVTRACK_DIR/.active_session" ]; then
-    dt_die "没有活跃会话。请先运行 'devtrack 开始'"
-fi
+_reset_change_tracking() {
+    changed_files=""
+    deleted_files=""
+    added_files=""
+    added_count=0
+    changed_count=0
+    deleted_count=0
+    total_changes=0
+}
 
-SESSION_ID="$(cat "$DEVTRACK_DIR/.active_session")"
-SESSION_DIR="$DEVTRACK_SESSIONS/$SESSION_ID"
-ROLLBACK_DIR="$DEVTRACK_DIR/rollback"
-BASELINE="$SESSION_DIR/baseline.json"
+_compute_manifest_diff() {
+    local baseline_file="$1"
+    local manifest_file="$2"
 
-[ -d "$SESSION_DIR" ] || dt_die "会话目录不存在: $SESSION_DIR"
+    _reset_change_tracking
+    [ -f "$baseline_file" ] || return 0
 
-dt_info "=== 结束会话: $SESSION_ID ==="
-dt_info ""
-
-# ──────────────────────────────────────
-# 1) 对比变更（基线 + 当前清单）
-# ──────────────────────────────────────
-changed_files=""
-deleted_files=""
-current_manifest="$(mktemp)"
-snapshot_manifest_only "$current_manifest"
-
-if [ -f "$BASELINE" ]; then
-    dt_info "正在对比变更..."
     declare -A baseline_sha=()
     declare -A current_sha=()
 
     while IFS='|' read -r fpath expected_sha; do
         [ -n "$fpath" ] || continue
         baseline_sha["$fpath"]="$expected_sha"
-    done < <(jq -r '.local_files[] | "\(.path)|\(.sha256)"' "$BASELINE")
+    done < <(jq -r '.local_files[] | "\(.path)|\(.sha256)"' "$baseline_file")
 
     while IFS='|' read -r fpath observed_sha; do
         [ -n "$fpath" ] || continue
@@ -139,7 +134,7 @@ if [ -f "$BASELINE" ]; then
             changed_files="${changed_files}${fpath}\n"
             changed_count=$((changed_count + 1))
         fi
-    done < <(jq -r '.local_files[] | "\(.path)|\(.sha256)"' "$current_manifest")
+    done < <(jq -r '.local_files[] | "\(.path)|\(.sha256)"' "$manifest_file")
 
     for fpath in "${!baseline_sha[@]}"; do
         if [ -z "${current_sha[$fpath]+x}" ]; then
@@ -147,9 +142,106 @@ if [ -f "$BASELINE" ]; then
             deleted_count=$((deleted_count + 1))
         fi
     done
+
+    total_changes=$((changed_count + deleted_count + added_count))
+}
+
+_find_latest_completed_session() {
+    local dir latest=""
+    for dir in $(find "$DEVTRACK_SESSIONS" -mindepth 1 -maxdepth 1 -type d | sort); do
+        [ -f "$dir/session.yaml" ] || continue
+        if grep -qE '^status:\s*"completed"$' "$dir/session.yaml"; then
+            latest="$dir"
+        fi
+    done
+
+    [ -n "$latest" ] && printf '%s\n' "$latest"
+}
+
+_start_backfill_session() {
+    local latest_completed_dir latest_completed_id latest_baseline baseline_count answer
+
+    latest_completed_dir="$(_find_latest_completed_session)"
+    [ -n "$latest_completed_dir" ] || dt_die "没有活跃会话。请先运行 'devtrack 开始'"
+
+    latest_completed_id="$(basename "$latest_completed_dir")"
+    latest_baseline="$latest_completed_dir/baseline.json"
+    [ -f "$latest_baseline" ] || dt_die "没有活跃会话。请先运行 'devtrack 开始'"
+
+    current_manifest="$(mktemp)"
+    snapshot_manifest_only "$current_manifest"
+    _compute_manifest_diff "$latest_baseline" "$current_manifest"
+
+    if [ "$total_changes" -eq 0 ]; then
+        dt_die "没有活跃会话。请先运行 'devtrack 开始'"
+    fi
+
+    dt_warn "检测到没有活跃会话，但存在可补录的开发变更。"
+    dt_info "  最近完成会话: $latest_completed_id"
+    dt_info "  检测到变更: $changed_count 个文件修改, $deleted_count 个文件删除, $added_count 个文件新增"
+    printf "是否创建补录会话并继续结束? [y/N] " >&2
+    if ! IFS= read -r answer; then
+        dt_die "已取消补录。请先运行 'devtrack 开始' 后重试"
+    fi
+
+    case "$answer" in
+        y|Y|yes|YES|Yes)
+            ;;
+        *)
+            dt_die "已取消补录。请先运行 'devtrack 开始' 后重试"
+            ;;
+    esac
+
+    SESSION_ID="$(dt_new_session_id)"
+    SESSION_DIR="$DEVTRACK_SESSIONS/$SESSION_ID"
+    mkdir -p "$SESSION_DIR"
+    cp "$latest_baseline" "$SESSION_DIR/baseline.json"
+    baseline_count="$(jq '.local_files | length' "$SESSION_DIR/baseline.json")"
+    backfill_from="$latest_completed_id"
+
+    cat > "$SESSION_DIR/session.yaml" << EOF
+session_id: "$SESSION_ID"
+started_at: "$(dt_iso_timestamp)"
+ended_at: ""
+status: "active"
+summary: ""
+files_at_start: $baseline_count
+files_changed: 0
+backfill_from: "$backfill_from"
+EOF
+
+    echo "$SESSION_ID" > "$DEVTRACK_DIR/.active_session"
+    dt_timeline_append "session_start" "补录会话开始: $SESSION_ID (基于最近完成会话 $backfill_from)"
+    dt_yaml_set "$DEVTRACK_STATE" "updated_at" "$(dt_iso_timestamp)"
+    precomputed_diff=1
+}
+
+if [ ! -f "$DEVTRACK_DIR/.active_session" ]; then
+    _start_backfill_session
 fi
 
-total_changes=$((changed_count + deleted_count + added_count))
+SESSION_ID="$(cat "$DEVTRACK_DIR/.active_session")"
+SESSION_DIR="$DEVTRACK_SESSIONS/$SESSION_ID"
+ROLLBACK_DIR="$DEVTRACK_DIR/rollback"
+BASELINE="$SESSION_DIR/baseline.json"
+
+[ -d "$SESSION_DIR" ] || dt_die "会话目录不存在: $SESSION_DIR"
+
+dt_info "=== 结束会话: $SESSION_ID ==="
+dt_info ""
+
+# ──────────────────────────────────────
+# 1) 对比变更（基线 + 当前清单）
+# ──────────────────────────────────────
+if [ -z "$current_manifest" ]; then
+    current_manifest="$(mktemp)"
+    snapshot_manifest_only "$current_manifest"
+fi
+
+dt_info "正在对比变更..."
+if [ "$precomputed_diff" -ne 1 ]; then
+    _compute_manifest_diff "$BASELINE" "$current_manifest"
+fi
 dt_info "本次会话变更: $changed_count 个文件修改, $deleted_count 个文件删除, $added_count 个文件新增"
 
 # 自动摘要

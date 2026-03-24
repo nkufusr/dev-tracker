@@ -35,6 +35,16 @@ dt_timestamp() {
     date '+%Y%m%d-%H%M%S'
 }
 
+dt_new_session_id() {
+    local candidate
+    candidate="$(dt_timestamp)"
+    while [ -e "$DEVTRACK_SESSIONS/$candidate" ]; do
+        sleep 1
+        candidate="$(dt_timestamp)"
+    done
+    printf "%s" "$candidate"
+}
+
 dt_iso_timestamp() {
     date '+%Y-%m-%dT%H:%M:%S'
 }
