@@ -85,8 +85,9 @@ _cleanup_devtrack_end() {
     [ -n "$rollback_tmp" ] && [ -d "$rollback_tmp" ] && rm -rf "$rollback_tmp"
 
     if [ "$finish_ok" -ne 1 ]; then
-        rm -f "$DEVTRACK_DIR/.active_session"
-        failure_summary="${summary:-devtrack 结束失败}"
+        # 保留 .active_session 标记，让下次 'devtrack 结束' 可以重试。
+        # session.yaml 标记为 "failed"，恢复逻辑会识别此状态并重新尝试。
+        failure_summary="${summary:-devtrack 结束失败（可重试）}"
         _update_session_meta "failed" "$failure_summary" "$total_changes"
     fi
 
@@ -146,6 +147,167 @@ _compute_manifest_diff() {
     total_changes=$((changed_count + deleted_count + added_count))
 }
 
+# ── 智能摘要：把变更文件按用途分类，生成简短描述 ──
+# 输入: 文件路径列表（绝对路径或项目相对路径）通过 stdin
+# 输出: 分类后的"category|file_basename"，每行一个
+_classify_files() {
+    local project_root="${PROJECT_ROOT:-$PWD}"
+    local fpath rel base cat
+    while IFS= read -r fpath; do
+        [ -z "$fpath" ] && continue
+        # 转为相对路径
+        rel="${fpath#$project_root/}"
+        rel="${rel#./}"
+        base="$(basename "$rel")"
+
+        # 跳过明显不重要的文件
+        case "$rel" in
+            .devtrack/*|.git/*|.claude/*|.cursor/*|.vscode/*|*.lock) continue ;;
+        esac
+
+        # 分类规则（路径优先于扩展名）
+        case "$rel" in
+            # 测试文件（覆盖前后置）
+            *test_*.py|*_test.py|*_test.go|*.test.ts|*.test.tsx|*.test.js|*.spec.ts|*.spec.tsx|*.spec.js|tests/*|*/tests/*|test/*|*/test/*)
+                cat="测试" ;;
+            # API / 路由
+            *api/*|*/routes/*|*/handlers/*|*/controllers/*|*/endpoints/*)
+                cat="API" ;;
+            # 数据模型 / Schema
+            *models/*|*/entities/*|*/domain/*)
+                cat="模型" ;;
+            *schemas/*|*/dto/*|*/types.py|*/types.ts)
+                cat="Schema" ;;
+            # 服务层
+            *services/*|*/usecases/*|*/use_cases/*)
+                cat="服务" ;;
+            # 前端
+            *components/*|*/widgets/*)
+                cat="组件" ;;
+            *pages/*|*/views/*|*/screens/*)
+                cat="页面" ;;
+            *stores/*|*/store/*|*/reducers/*|*/slices/*)
+                cat="状态" ;;
+            *hooks/*) cat="Hook" ;;
+            # 数据库迁移
+            *migrations/*|*/alembic/versions/*|*.sql)
+                cat="迁移" ;;
+            # 文档
+            *.md|*.rst|*.adoc|docs/*|*/docs/*|README*|CHANGELOG*)
+                cat="文档" ;;
+            # CI / 部署
+            .github/*|.gitlab-ci*|Jenkinsfile*|*/ci/*)
+                cat="CI" ;;
+            Dockerfile|*Dockerfile*|docker-compose*.yml|docker-compose*.yaml|*.dockerfile)
+                cat="部署" ;;
+            # 配置 / 构建
+            pyproject.toml|setup.py|setup.cfg|requirements*.txt|package.json|tsconfig*.json|vite.config.*|webpack.config.*|Makefile|*.mk)
+                cat="构建" ;;
+            *.yaml|*.yml|*.toml|*.ini|.env*|*.conf)
+                cat="配置" ;;
+            # 脚本
+            *.sh|scripts/*|*/scripts/*)
+                cat="脚本" ;;
+            # 按扩展名兜底
+            *.py|*.go|*.rs|*.java|*.kt|*.cpp|*.c|*.h|*.ts|*.tsx|*.js|*.jsx|*.vue|*.svelte)
+                cat="代码" ;;
+            *)  cat="其他" ;;
+        esac
+
+        # 输出 category|basename（去除扩展名让标识更短）
+        local short="${base%.*}"
+        printf '%s|%s\n' "$cat" "$short"
+    done
+}
+
+# ── 把分类后的"cat|name"按类别合并、限制名字数量 ──
+# 输出格式: "API: users, auth | 模型: user (+1) | 测试: +3"
+_format_category_summary() {
+    local input_tsv="$1"
+    [ -s "$input_tsv" ] || { printf ''; return 0; }
+
+    # 排序后按类别 group
+    awk -F'|' '
+        { cat = $1; name = $2; cnt[cat]++; if (cnt[cat] <= 3) names[cat] = (names[cat] == "" ? name : names[cat] ", " name) }
+        END {
+            # 按预设优先级输出（API > 模型 > Schema > 服务 > 组件 > 页面 > 测试 > 迁移 > 文档 > 配置 > CI > 部署 > 构建 > 脚本 > 状态 > Hook > 代码 > 其他）
+            n = split("API|模型|Schema|服务|组件|页面|测试|状态|Hook|迁移|文档|CI|部署|构建|配置|脚本|代码|其他", order, "|")
+            for (i = 1; i <= n; i++) {
+                c = order[i]
+                if (c in cnt) {
+                    extra = cnt[c] - 3
+                    if (extra > 0) {
+                        printf "%s: %s (+%d)", c, names[c], extra
+                    } else {
+                        printf "%s: %s", c, names[c]
+                    }
+                    printf " | "
+                }
+            }
+        }
+    ' "$input_tsv" | sed 's/ | $//'
+}
+
+# ── git 行数统计（如果当前目录是 git 仓库）──
+# 输出形如: "+340/-15"，无 git 时返回空
+_git_line_stats() {
+    git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    local stat
+    # 跟踪所有变更（已暂存 + 未暂存）vs HEAD
+    stat="$(git -C "$PWD" diff HEAD --shortstat 2>/dev/null)"
+    [ -z "$stat" ] && return 0
+    # 形如 " 5 files changed, 340 insertions(+), 15 deletions(-)"
+    local ins del
+    ins="$(printf '%s' "$stat" | grep -oE '[0-9]+ insertion' | grep -oE '^[0-9]+' || echo 0)"
+    del="$(printf '%s' "$stat" | grep -oE '[0-9]+ deletion' | grep -oE '^[0-9]+' || echo 0)"
+    [ "$ins" = "0" ] && [ "$del" = "0" ] && return 0
+    printf '+%s/-%s' "$ins" "$del"
+}
+
+# ── 综合：用变更文件 + git 统计生成智能摘要 ──
+# 全局变量: changed_files / added_files / deleted_files (带换行的字符串)
+# 输出: 单行摘要字符串
+_generate_smart_summary() {
+    local class_tsv summary_main git_stat
+    class_tsv="$(mktemp)"
+    {
+        echo -e "$changed_files" | sed '/^$/d'
+        echo -e "$added_files" | sed '/^$/d'
+    } | _classify_files > "$class_tsv"
+
+    summary_main="$(_format_category_summary "$class_tsv")"
+    rm -f "$class_tsv"
+
+    # 没归类到任何文件（如全是 .devtrack/ 或被忽略）
+    if [ -z "$summary_main" ]; then
+        if [ "$total_changes" -gt 0 ]; then
+            summary_main="变更 $total_changes 个文件"
+        else
+            printf '无文件变更'
+            return 0
+        fi
+    fi
+
+    # 操作类型前缀（单一动作时简化）
+    local prefix=""
+    if [ "$added_count" -gt 0 ] && [ "$changed_count" -eq 0 ] && [ "$deleted_count" -eq 0 ]; then
+        prefix="新增 — "
+    elif [ "$changed_count" -gt 0 ] && [ "$added_count" -eq 0 ] && [ "$deleted_count" -eq 0 ]; then
+        prefix="修改 — "
+    elif [ "$deleted_count" -gt 0 ] && [ "$added_count" -eq 0 ] && [ "$changed_count" -eq 0 ]; then
+        prefix="删除 — "
+    fi
+
+    # git 行数后缀
+    git_stat="$(_git_line_stats 2>/dev/null || true)"
+
+    if [ -n "$git_stat" ]; then
+        printf '%s%s [%s]' "$prefix" "$summary_main" "$git_stat"
+    else
+        printf '%s%s' "$prefix" "$summary_main"
+    fi
+}
+
 _find_latest_completed_session() {
     local dir latest=""
     for dir in $(find "$DEVTRACK_SESSIONS" -mindepth 1 -maxdepth 1 -type d | sort); do
@@ -156,6 +318,33 @@ _find_latest_completed_session() {
     done
 
     [ -n "$latest" ] && printf '%s\n' "$latest"
+}
+
+# 扫描 sessions/ 找回 active/failed 状态的孤儿会话（标记丢失但会话还在）
+# 返回最新的孤儿会话 ID（按时间倒序），找不到返回非零
+_find_orphan_session() {
+    local dir status session_id
+    # 按目录名倒序遍历（目录名即 timestamp）
+    for dir in $(find "$DEVTRACK_SESSIONS" -mindepth 1 -maxdepth 1 -type d | sort -r); do
+        [ -f "$dir/session.yaml" ] || continue
+        [ -f "$dir/baseline.json" ] || continue
+
+        status="$(grep -E '^status:' "$dir/session.yaml" | head -1 | sed -E 's/^status:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+        session_id="$(basename "$dir")"
+
+        case "$status" in
+            active|failed)
+                # 孤儿会话：标记是 active 或 failed 但 .active_session 不存在
+                printf '%s\n' "$session_id"
+                return 0
+                ;;
+            completed|abandoned)
+                # 遇到正常结束的会话就停止搜索（更早的会话更不可能是孤儿）
+                return 1
+                ;;
+        esac
+    done
+    return 1
 }
 
 _start_backfill_session() {
@@ -217,7 +406,23 @@ EOF
 }
 
 if [ ! -f "$DEVTRACK_DIR/.active_session" ]; then
-    _start_backfill_session
+    # 优先尝试恢复孤儿会话（标记丢失但 session.yaml 还在的情况，
+    # 通常因为上次 'devtrack 结束' 被超时/中断后异常清理导致）
+    orphan_id="$(_find_orphan_session 2>/dev/null || true)"
+    if [ -n "$orphan_id" ]; then
+        orphan_status="$(grep -E '^status:' "$DEVTRACK_SESSIONS/$orphan_id/session.yaml" | head -1 | sed -E 's/^status:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+        dt_warn "检测到孤儿会话: $orphan_id (状态: $orphan_status)"
+        dt_info "  恢复该会话以继续完成结束流程..."
+        echo "$orphan_id" > "$DEVTRACK_DIR/.active_session"
+        # 把状态改回 active，让正常的结束流程接管
+        if [ "$orphan_status" = "failed" ]; then
+            tmp="$(mktemp)"
+            sed -E 's|^status:.*|status: "active"|' "$DEVTRACK_SESSIONS/$orphan_id/session.yaml" > "$tmp"
+            mv -f "$tmp" "$DEVTRACK_SESSIONS/$orphan_id/session.yaml"
+        fi
+    else
+        _start_backfill_session
+    fi
 fi
 
 SESSION_ID="$(cat "$DEVTRACK_DIR/.active_session")"
@@ -244,21 +449,12 @@ if [ "$precomputed_diff" -ne 1 ]; then
 fi
 dt_info "本次会话变更: $changed_count 个文件修改, $deleted_count 个文件删除, $added_count 个文件新增"
 
-# 自动摘要
+# 自动摘要：用户未提供 → 启发式智能生成
 if [ -z "$summary" ]; then
-    if [ "$total_changes" -gt 0 ]; then
-        if [ "$changed_count" -le 5 ] && [ "$changed_count" -gt 0 ] && [ "$added_count" -eq 0 ] && [ "$deleted_count" -eq 0 ]; then
-            file_list="$(echo -e "$changed_files" | sed '/^$/d' | sed 's|.*/||' | tr '\n' ', ' | sed 's/,$//')"
-            summary="修改了: $file_list"
-        elif [ "$added_count" -le 5 ] && [ "$added_count" -gt 0 ] && [ "$changed_count" -eq 0 ] && [ "$deleted_count" -eq 0 ]; then
-            file_list="$(echo -e "$added_files" | sed '/^$/d' | sed 's|.*/||' | tr '\n' ', ' | sed 's/,$//')"
-            summary="新增了: $file_list"
-        else
-            summary="变更了 $total_changes 个文件"
-        fi
-    else
-        summary="无文件变更"
-    fi
+    # 设置 PROJECT_ROOT 给 _classify_files 用
+    PROJECT_ROOT="$(grep -E '^\s+root:' "$DEVTRACK_CONFIG" 2>/dev/null | head -1 | sed -E 's/^\s+root:\s*"?([^"]*)"?\s*$/\1/')"
+    PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+    summary="$(_generate_smart_summary)"
 fi
 
 # 写变更记录

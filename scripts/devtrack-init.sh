@@ -115,6 +115,17 @@ commands:
   build: ""
   test: ""
   health: ""
+
+# 备份优化（大项目降空间占用）
+storage:
+  # 保留几代历史回滚包（默认 3，加上当前 = 4 份）
+  rollback_keep: 3
+  # 是否尊重 .gitignore（默认 true，会自动跳过 node_modules/build 等）
+  respect_gitignore: true
+  # 跨代去重策略: hardlink (推荐, 同分区下无额外空间) | copy (传统全量复制)
+  dedup_strategy: "hardlink"
+  # 是否对备份文件做 zstd 压缩（默认 true，需要安装 zstd 命令）
+  compress: true
 EOF
     dt_info "已创建 config.yaml（请编辑以自定义追踪路径和构建命令）"
 fi

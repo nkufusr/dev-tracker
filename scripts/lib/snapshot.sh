@@ -100,13 +100,52 @@ _snap_get_command() {
     grep -A 10 '^commands:' "$DEVTRACK_CONFIG" 2>/dev/null | grep "${cmd_name}:" | head -1 | sed -E "s/.*${cmd_name}:\s*\"?([^\"]*?)\"?\s*$/\1/" || true
 }
 
+# Read storage section options (with defaults)
+_snap_get_storage_opt() {
+    local key="$1" default="$2"
+    local val
+    val="$(grep -A 10 '^storage:' "$DEVTRACK_CONFIG" 2>/dev/null | grep -E "^\s+${key}:" | head -1 | sed -E "s/^\s+${key}:\s*\"?([^\"#]*?)\"?(\s*#.*)?$/\1/" | tr -d '[:space:]')"
+    [ -n "$val" ] && printf '%s' "$val" || printf '%s' "$default"
+}
+
+_snap_respect_gitignore() {
+    local v
+    v="$(_snap_get_storage_opt "respect_gitignore" "true")"
+    [ "$v" = "true" ] || [ "$v" = "yes" ] || [ "$v" = "1" ]
+}
+
+_snap_dedup_strategy() {
+    _snap_get_storage_opt "dedup_strategy" "hardlink"
+}
+
+_snap_compress_enabled() {
+    local v
+    v="$(_snap_get_storage_opt "compress" "true")"
+    [ "$v" = "true" ] || [ "$v" = "yes" ] || [ "$v" = "1" ]
+}
+
+_snap_has_zstd() {
+    command -v zstd >/dev/null 2>&1
+}
+
+# Test if two paths are on the same filesystem (hardlink possible)
+_snap_same_filesystem() {
+    local a="$1" b="$2"
+    [ -e "$a" ] || return 1
+    [ -e "$b" ] || return 1
+    local da db
+    da="$(stat -c '%d' "$a" 2>/dev/null)" || return 1
+    db="$(stat -c '%d' "$b" 2>/dev/null)" || return 1
+    [ "$da" = "$db" ]
+}
+
 # 收集所有文件（全量，排除 build 产物）
 # 排除规则支持：
 #   dir/          → 精确目录名（任意层级）
 #   */dir/        → 任意父目录下的 dir（如 */build/ 匹配 app/build/）
 #   *.ext         → 扩展名通配（如 *.pyc）
 #   explicit/path → 精确路径
-_snap_collect_all_files() {
+_snap_collect_all_files_legacy() {
     local include_file exclude_file
     exclude_file="$(mktemp)"
     include_file="$(mktemp)"
@@ -219,6 +258,84 @@ _snap_collect_all_files() {
     rm -f "$include_file" "$exclude_file"
 }
 
+_snap_emit_rg_include_globs() {
+    local pattern="${1%/}"
+    [ -n "$pattern" ] || return 0
+
+    case "$pattern" in
+        */\*)
+            printf '%s\n' "${pattern%/*}/**"
+            ;;
+        *[\*\?\[]*)
+            printf '%s\n' "$pattern"
+            ;;
+        */*)
+            printf '%s\n' "$pattern"
+            printf '%s/**\n' "$pattern"
+            ;;
+        *)
+            printf '%s\n' "$pattern"
+            printf '**/%s\n' "$pattern"
+            ;;
+    esac
+}
+
+_snap_emit_rg_exclude_globs() {
+    local pattern="${1%/}"
+    [ -n "$pattern" ] || return 0
+
+    case "$pattern" in
+        *[\*\?\[]*)
+            printf '!%s\n' "$pattern"
+            printf '!**/%s\n' "$pattern"
+            ;;
+        *)
+            printf '!%s\n' "$pattern"
+            printf '!%s/**\n' "$pattern"
+            printf '!**/%s\n' "$pattern"
+            printf '!**/%s/**\n' "$pattern"
+            ;;
+    esac
+}
+
+_snap_collect_all_files() {
+    if command -v rg >/dev/null 2>&1; then
+        local rg_args=("--files" "--hidden")
+        # Honor .gitignore unless config disables it (default: respect)
+        if ! _snap_respect_gitignore; then
+            rg_args+=("--no-ignore")
+        fi
+        # Always exclude .git/ even when respecting gitignore
+        rg_args+=("-g" "!.git" "-g" "!.git/**")
+
+        while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            while IFS= read -r glob; do
+                [ -z "$glob" ] && continue
+                rg_args+=("-g" "$glob")
+            done < <(_snap_emit_rg_include_globs "$pattern")
+        done < <(_snap_parse_local_paths)
+
+        while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            _snap_should_skip_exclude "$pattern" && continue
+            while IFS= read -r glob; do
+                [ -z "$glob" ] && continue
+                rg_args+=("-g" "$glob")
+            done < <(_snap_emit_rg_exclude_globs "$pattern")
+        done < <(
+            _snap_parse_ignore_paths
+            _snap_parse_excludes
+            [ -n "${SNAPSHOT_EXTRA_EXCLUDES:-}" ] && printf '%s\n' "${SNAPSHOT_EXTRA_EXCLUDES}"
+        )
+
+        rg "${rg_args[@]}" | sed 's|^|./|' | sort
+        return 0
+    fi
+
+    _snap_collect_all_files_legacy
+}
+
 _snap_sha_tsv_to_json() {
     local tsv_file="$1"
     jq -Rn '
@@ -235,7 +352,13 @@ _snap_backup_tsv_to_json() {
         [inputs
          | select(length > 0)
          | split("\t")
-         | {path: .[0], backup_rel: .[1], backup_sha256: .[2]}]
+         | {
+             path: .[0],
+             backup_rel: .[1],
+             backup_sha256: .[2],
+             source_sha256: (.[3] // .[2]),
+             compressed: ((.[4] // "false") == "true")
+           }]
     ' < "$tsv_file"
 }
 
@@ -248,27 +371,44 @@ _snap_services_tsv_to_json() {
 snapshot_manifest_only() {
     local out_file="$1"
     local project_root="$PWD"
-    local files_json_tmp entries_tsv_tmp
+    local files_json_tmp entries_tsv_tmp relpaths_tmp sha_output_tmp
     files_json_tmp="$(mktemp)"
     entries_tsv_tmp="$(mktemp)"
+    relpaths_tmp="$(mktemp)"
+    sha_output_tmp="$(mktemp)"
     echo "[]" > "$files_json_tmp"
     : > "$entries_tsv_tmp"
+    : > "$relpaths_tmp"
+    : > "$sha_output_tmp"
 
     while IFS= read -r relpath; do
         [ -z "$relpath" ] && continue
-        relpath="${relpath#./}"
-        fullpath="$project_root/$relpath"
-        [ -f "$fullpath" ] || continue
-        sha="$(dt_sha256 "$fullpath")"
-        printf '%s\t%s\n' "$fullpath" "$sha" >> "$entries_tsv_tmp"
+        printf '%s\n' "${relpath#./}" >> "$relpaths_tmp"
     done < <(_snap_collect_all_files)
+
+    if [ -s "$relpaths_tmp" ]; then
+        (
+            cd "$project_root"
+            tr '\n' '\0' < "$relpaths_tmp" | xargs -0 -r sha256sum --
+        ) > "$sha_output_tmp"
+
+        awk -v root="$project_root" '
+            BEGIN { OFS = "\t" }
+            {
+                sha = $1
+                sub(/^[^[:space:]]+[[:space:]]+/, "", $0)
+                sub(/^\.\//, "", $0)
+                print root "/" $0, sha
+            }
+        ' "$sha_output_tmp" >> "$entries_tsv_tmp"
+    fi
 
     _snap_sha_tsv_to_json "$entries_tsv_tmp" > "$files_json_tmp"
 
     jq -n --arg ts "$(dt_iso_timestamp)" --slurpfile files "$files_json_tmp" \
         '{created_at: $ts, local_files: $files[0]}' > "$out_file"
 
-    rm -f "$files_json_tmp" "$entries_tsv_tmp"
+    rm -f "$files_json_tmp" "$entries_tsv_tmp" "$relpaths_tmp" "$sha_output_tmp"
 }
 
 # snapshot_create_from_manifest <manifest_json> <output_dir> <description>
@@ -301,22 +441,97 @@ snapshot_create_from_manifest() {
     : > "$local_entries_tsv"
     : > "$remote_entries_tsv"
     : > "$services_entries_tsv"
-    local count=0
+
+    # ── 优化：决定去重和压缩策略 ──
+    local prev_dir="$DEVTRACK_DIR/rollback"
+    local prev_manifest="$prev_dir/manifest.json"
+    local prev_lookup_tmp=""
+    local use_hardlink=0
+    local use_compress=0
+
+    if [ "$(_snap_dedup_strategy)" = "hardlink" ] \
+       && [ -f "$prev_manifest" ] \
+       && _snap_same_filesystem "$prev_dir" "$out_dir"; then
+        use_hardlink=1
+        # 构建查找表: path → "source_sha256\tbackup_rel\tcompressed"
+        prev_lookup_tmp="$(mktemp)"
+        jq -r '.local_files[] | [.path, (.source_sha256 // .backup_sha256), .backup_rel, (if .compressed then "true" else "false" end)] | @tsv' \
+            "$prev_manifest" > "$prev_lookup_tmp" 2>/dev/null || : > "$prev_lookup_tmp"
+    fi
+
+    if _snap_compress_enabled && _snap_has_zstd; then
+        use_compress=1
+    fi
+
+    local count=0 reused=0 copied=0
     while IFS=$'\t' read -r fullpath sha; do
         [ -n "$fullpath" ] || continue
 
         relpath="${fullpath#$project_root/}"
         [ "$relpath" = "$fullpath" ] && relpath="$(basename "$fullpath")"
-        backup_rel="originals/local/$relpath"
-        mkdir -p "$out_dir/$(dirname "$backup_rel")"
-        cp "$fullpath" "$out_dir/$backup_rel"
 
-        printf '%s\t%s\t%s\n' "$fullpath" "$backup_rel" "$sha" >> "$local_entries_tsv"
+        local hardlinked=0
+        local backup_rel="" backup_sha="" compressed_flag="false"
+
+        # 尝试硬链接复用
+        if [ "$use_hardlink" -eq 1 ] && [ -s "$prev_lookup_tmp" ]; then
+            local prev_entry
+            prev_entry="$(awk -F'\t' -v p="$fullpath" '$1 == p {print; exit}' "$prev_lookup_tmp")"
+            if [ -n "$prev_entry" ]; then
+                local prev_sha prev_backup_rel prev_compressed
+                prev_sha="$(printf '%s' "$prev_entry" | awk -F'\t' '{print $2}')"
+                prev_backup_rel="$(printf '%s' "$prev_entry" | awk -F'\t' '{print $3}')"
+                prev_compressed="$(printf '%s' "$prev_entry" | awk -F'\t' '{print $4}')"
+
+                if [ "$prev_sha" = "$sha" ] && [ -f "$prev_dir/$prev_backup_rel" ]; then
+                    # 内容未变 → 直接硬链接复用上代备份
+                    backup_rel="$prev_backup_rel"
+                    compressed_flag="$prev_compressed"
+                    mkdir -p "$out_dir/$(dirname "$backup_rel")"
+                    if ln "$prev_dir/$prev_backup_rel" "$out_dir/$backup_rel" 2>/dev/null; then
+                        backup_sha="$(dt_sha256 "$out_dir/$backup_rel")"
+                        hardlinked=1
+                        reused=$((reused + 1))
+                    fi
+                fi
+            fi
+        fi
+
+        # 硬链接失败或未启用 → 复制（可选压缩）
+        if [ "$hardlinked" -eq 0 ]; then
+            if [ "$use_compress" -eq 1 ]; then
+                backup_rel="originals/local/${relpath}.zst"
+                compressed_flag="true"
+            else
+                backup_rel="originals/local/$relpath"
+                compressed_flag="false"
+            fi
+            mkdir -p "$out_dir/$(dirname "$backup_rel")"
+            if [ "$use_compress" -eq 1 ]; then
+                zstd -q -19 --long --force -o "$out_dir/$backup_rel" "$fullpath" 2>/dev/null \
+                    || zstd -q --force -o "$out_dir/$backup_rel" "$fullpath"
+            else
+                cp "$fullpath" "$out_dir/$backup_rel"
+            fi
+            backup_sha="$(dt_sha256 "$out_dir/$backup_rel")"
+            copied=$((copied + 1))
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\n' "$fullpath" "$backup_rel" "$backup_sha" "$sha" "$compressed_flag" >> "$local_entries_tsv"
         count=$((count + 1))
         if [ $((count % 500)) -eq 0 ]; then
-            dt_info "  已备份 $count 个本地文件..."
+            dt_info "  已处理 $count 个本地文件 (复用 $reused, 复制 $copied)..."
         fi
     done < <(jq -r '.local_files[] | [.path, .sha256] | @tsv' "$manifest_file")
+
+    [ -n "$prev_lookup_tmp" ] && rm -f "$prev_lookup_tmp"
+
+    if [ "$use_hardlink" -eq 1 ] || [ "$use_compress" -eq 1 ]; then
+        local strat=""
+        [ "$use_hardlink" -eq 1 ] && strat="${strat}硬链接复用 $reused, "
+        [ "$use_compress" -eq 1 ] && strat="${strat}zstd 压缩"
+        dt_info "  备份策略: ${strat:-全量复制}, 实际复制 $copied 个"
+    fi
 
     _snap_backup_tsv_to_json "$local_entries_tsv" > "$local_files_json_tmp"
 
@@ -398,20 +613,30 @@ echo "项目: $ROOT"
 echo ""
 
 echo "--- 本地文件 ---"
-jq -r '.local_files[] | "\(.backup_rel)|\(.path)"' "$MANIFEST" | while IFS='|' read -r brel target; do
+jq -r '.local_files[] | [.backup_rel, .path, (.source_sha256 // .backup_sha256), (if .compressed then "1" else "0" end)] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r brel target src_sha compressed; do
     src="$SCRIPT_DIR/$brel"
     [ -f "$src" ] || { echo "  跳过(缺失): $target"; continue; }
     if [ "$MODE" = "--dry-run" ]; then
         if [ -f "$target" ]; then
             cur="$(sha256sum "$target" | awk '{print $1}')"
-            bak="$(sha256sum "$src" | awk '{print $1}')"
-            [ "$cur" = "$bak" ] && echo "  未变更: $(echo "$target" | sed "s|$ROOT/||")" || echo "  将恢复: $(echo "$target" | sed "s|$ROOT/||")"
+            if [ "$compressed" = "1" ]; then
+                # 比对源内容 SHA（manifest 里的 source_sha256）
+                [ "$cur" = "$src_sha" ] && echo "  未变更: $(echo "$target" | sed "s|$ROOT/||")" || echo "  将恢复: $(echo "$target" | sed "s|$ROOT/||")"
+            else
+                bak="$(sha256sum "$src" | awk '{print $1}')"
+                [ "$cur" = "$bak" ] && echo "  未变更: $(echo "$target" | sed "s|$ROOT/||")" || echo "  将恢复: $(echo "$target" | sed "s|$ROOT/||")"
+            fi
         else
             echo "  将创建: $(echo "$target" | sed "s|$ROOT/||")"
         fi
     else
         mkdir -p "$(dirname "$target")"
-        cp "$src" "$target"
+        if [ "$compressed" = "1" ]; then
+            command -v zstd >/dev/null 2>&1 || { echo "  错误: 备份已压缩但未安装 zstd"; exit 1; }
+            zstd -d -q --force -o "$target" "$src"
+        else
+            cp "$src" "$target"
+        fi
         echo "  已恢复: $(echo "$target" | sed "s|$ROOT/||")"
     fi
 done
@@ -470,7 +695,8 @@ errors=0
 echo ""
 echo "--- 文件完整性 ---"
 total=0; ok=0; mismatch=0; missing=0
-jq -r '.local_files[] | "\(.path)|\(.backup_sha256)"' "$MANIFEST" | while IFS='|' read -r fpath expected; do
+# 用 source_sha256 比对（恢复后磁盘上的应是源内容）
+jq -r '.local_files[] | [.path, (.source_sha256 // .backup_sha256)] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r fpath expected; do
     total=$((total+1))
     if [ ! -f "$fpath" ]; then
         echo "  缺失: $(echo "$fpath" | sed "s|$ROOT/||")"
